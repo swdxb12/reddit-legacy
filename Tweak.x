@@ -20,7 +20,6 @@ static const NSUInteger kMaxJSONBytes = 20 * 1024 * 1024;
 static const int kMaxDepth = 64;
 static const NSInteger kCoverTag = 0x52454444;
 static const NSInteger kDownloadRowTag = 0x52454445;
-static const CGFloat kDownloadRowHeight = 48;
 static BOOL blurEnabled = YES;
 static const CGFloat kMinMediaWidth = 100;
 static const CGFloat kMinThumbnailWidth = 40;
@@ -29,6 +28,8 @@ static NSCache<NSString *, UIImage *> *revealedImages;
 static NSMutableSet<NSString *> *revealedPosts;
 static NSMutableDictionary<NSString *, NSDictionary *> *clipsByTitle;
 static char kRowClipKey;
+static char kRowAnchorKey;
+static char kRowHeightKey;
 static __weak UIView *lastTouchedStack;
 static char kPostKey;
 static char kFeedMediaKey;
@@ -1420,53 +1421,114 @@ static UICollectionView *firstCollectionView(UIView *view, int depth) {
   return nil;
 }
 
-// Copies the look of the sheet's own rows.
-static UILabel *firstRowLabel(UIView *view, int depth) {
-  if ([view isKindOfClass:UILabel.class] && [NSStringFromClass(view.superview.class) containsString:@"LabelSliceView"]) return (UILabel *)view;
-  if (depth > 10) return nil;
+static void collectRowLabels(UIView *view, NSMutableArray<UILabel *> *found, int depth) {
+  if (depth > 10) return;
+  if ([view isKindOfClass:UILabel.class] && [NSStringFromClass(view.superview.class) containsString:@"LabelSliceView"]) {
+    [found addObject:(UILabel *)view];
+    return;
+  }
+  for (UIView *child in view.subviews) collectRowLabels(child, found, depth + 1);
+}
+
+static UIImageView *firstIconIn(UIView *view, int depth) {
+  if ([view isKindOfClass:UIImageView.class] && CGRectGetWidth(view.bounds) > 0) return (UIImageView *)view;
+  if (depth > 8) return nil;
   for (UIView *child in view.subviews) {
-    UILabel *found = firstRowLabel(child, depth + 1);
+    UIImageView *found = firstIconIn(child, depth + 1);
     if (found) return found;
   }
   return nil;
 }
 
-// The sheet's rows are built from Swift data this tweak can't add to, so the row sits above them
-// in space opened at the top of the list.
+// Finds the app's "Save" row by its word in the app's language. If the word isn't known, the second
+// row is used, which is where that row normally sits.
+static UILabel *saveRowLabel(NSArray<UILabel *> *labels) {
+  NSArray<NSString *> *words = @[
+    @"guardar", @"save", @"salvar", @"enregistrer", @"sauvegarder", @"speichern", @"salva", @"opslaan", @"spara",
+    @"gem", @"lagre", @"tallenna", @"zapisz", @"uložit", @"kaydet", @"сохран", @"збере", @"保存", @"儲存", @"저장",
+    @"حفظ", @"שמור", @"simpan", @"lưu", @"mentés", @"salvează", @"αποθήκευση", @"บันทึก", @"सहेज"
+  ];
+  for (UILabel *label in labels) {
+    NSString *text = label.text.lowercaseString;
+    for (NSString *word in words) {
+      if ([text hasPrefix:word]) return label;
+    }
+  }
+  return labels.count > 1 ? labels[1] : labels.firstObject;
+}
+
+static UICollectionViewCell *cellOfView(UIView *view) {
+  while (view && ![view isKindOfClass:UICollectionViewCell.class]) view = view.superview;
+  return (UICollectionViewCell *)view;
+}
+
+// Rows below the new one are moved down each time the list lays out, because it keeps reusing them
+// while scrolling. A view's center ignores this offset, so it still gives the row's real place.
+static void shiftRowsBelowDownloadRow(UICollectionView *list) {
+  NSNumber *anchor = objc_getAssociatedObject(list, &kRowAnchorKey);
+  NSNumber *height = objc_getAssociatedObject(list, &kRowHeightKey);
+  if (!anchor) return;
+  for (UIView *view in list.subviews) {
+    if (![view isKindOfClass:UICollectionReusableView.class]) continue;
+    view.transform = view.center.y > anchor.doubleValue ? CGAffineTransformMakeTranslation(0, height.doubleValue) : CGAffineTransformIdentity;
+  }
+}
+
+// The sheet's rows are built from Swift data this tweak can't add to, so this row is placed in a gap
+// opened under the app's "Save" row, with that row's look.
 static void addDownloadRow(UICollectionView *list, NSDictionary *clip) {
   if ([list viewWithTag:kDownloadRowTag]) return;
+  NSMutableArray<UILabel *> *labels = [NSMutableArray array];
+  for (UICollectionViewCell *cell in list.visibleCells) collectRowLabels(cell, labels, 0);
+  [labels sortUsingComparator:^NSComparisonResult(UILabel *a, UILabel *b) {
+    CGFloat ay = [a convertPoint:CGPointZero toView:list].y;
+    CGFloat by = [b convertPoint:CGPointZero toView:list].y;
+    return ay < by ? NSOrderedAscending : ay > by ? NSOrderedDescending : NSOrderedSame;
+  }];
+  UILabel *model = saveRowLabel(labels);
+  UICollectionViewCell *modelCell = cellOfView(model);
+  if (!model || !modelCell) return;
+
   static RedditLegacyCoverTarget *target;
   if (!target) target = [RedditLegacyCoverTarget new];
-  UILabel *model = firstRowLabel(list, 0);
-  UIColor *color = model.textColor ?: UIColor.labelColor;
-  UIControl *row = [[UIControl alloc] initWithFrame:CGRectMake(0, -kDownloadRowHeight, CGRectGetWidth(list.bounds), kDownloadRowHeight)];
+  CGFloat height = CGRectGetHeight(modelCell.bounds);
+  CGFloat anchor = modelCell.center.y + height / 2;
+  CGRect labelFrame = [model convertRect:model.bounds toView:modelCell];
+  UIImageView *modelIcon = firstIconIn(modelCell, 0);
+  CGRect iconFrame = modelIcon ? [modelIcon convertRect:modelIcon.bounds toView:modelCell] : CGRectMake(16, (height - 24) / 2, 24, 24);
+
+  UIControl *row = [[UIControl alloc] initWithFrame:CGRectMake(0, anchor, CGRectGetWidth(list.bounds), height)];
   row.tag = kDownloadRowTag;
   row.autoresizingMask = UIViewAutoresizingFlexibleWidth;
   objc_setAssociatedObject(row, &kRowClipKey, clip, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
   [row addTarget:target action:@selector(downloadRowTapped:) forControlEvents:UIControlEventTouchUpInside];
 
-  UIImageSymbolConfiguration *symbol = [UIImageSymbolConfiguration configurationWithPointSize:18];
+  UIImageSymbolConfiguration *symbol = [UIImageSymbolConfiguration configurationWithPointSize:CGRectGetHeight(iconFrame) * 0.72];
   UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"arrow.down.to.line" withConfiguration:symbol]];
-  icon.tintColor = color;
+  icon.tintColor = modelIcon.tintColor ?: model.textColor;
   icon.contentMode = UIViewContentModeCenter;
-  icon.frame = CGRectMake(16, 0, 24, kDownloadRowHeight);
+  icon.frame = iconFrame;
   icon.userInteractionEnabled = NO;
   [row addSubview:icon];
 
-  UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(44, 0, CGRectGetWidth(list.bounds) - 60, kDownloadRowHeight)];
+  UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(CGRectGetMinX(labelFrame), CGRectGetMinY(labelFrame),
+                                                             CGRectGetWidth(list.bounds) - CGRectGetMinX(labelFrame) - 16,
+                                                             CGRectGetHeight(labelFrame))];
   label.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-  label.font = model.font ?: [UIFont systemFontOfSize:16];
-  label.textColor = color;
+  label.font = model.font;
+  label.textColor = model.textColor;
   label.text = downloadText([clip[@"isGif"] boolValue] ? DownloadTextGif : DownloadTextVideo);
   label.userInteractionEnabled = NO;
   [row addSubview:label];
 
   [list addSubview:row];
+  objc_setAssociatedObject(list, &kRowAnchorKey, @(anchor), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  objc_setAssociatedObject(list, &kRowHeightKey, @(height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
   UIEdgeInsets insets = list.contentInset;
-  insets.top += kDownloadRowHeight;
+  insets.bottom += height;
   list.contentInset = insets;
-  list.contentOffset = CGPointMake(list.contentOffset.x, list.contentOffset.y - kDownloadRowHeight);
-  logDownload(@"sheet row added");
+  shiftRowsBelowDownloadRow(list);
+  logDownload([NSString stringWithFormat:@"sheet row under \"%@\" rows=%lu", model.text, (unsigned long)labels.count]);
 }
 
 // The list is built after the sheet is presented, so it is looked for over the first moments.
@@ -1481,7 +1543,7 @@ static void offerDownloadInSheet(UIViewController *sheet) {
       UIViewController *strongSheet = weakSheet;
       if (!strongSheet.isViewLoaded) return;
       UICollectionView *list = firstCollectionView(strongSheet.view, 0);
-      if (list && CGRectGetWidth(list.bounds) > 0 && firstRowLabel(list, 0)) addDownloadRow(list, clip);
+      if (list && CGRectGetWidth(list.bounds) > 0 && list.visibleCells.count > 0) addDownloadRow(list, clip);
     });
   }
 }
@@ -1542,6 +1604,13 @@ static BOOL isZeroOnline(UILabel *label, NSString *text) {
   logPresented(controller);
   %orig;
   if ([NSStringFromClass(controller.class) containsString:@"ShareOverflowBottomSheet"]) offerDownloadInSheet(controller);
+}
+%end
+
+%hook UICollectionView
+- (void)layoutSubviews {
+  %orig;
+  if (objc_getAssociatedObject(self, &kRowAnchorKey)) shiftRowsBelowDownloadRow(self);
 }
 %end
 
