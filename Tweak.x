@@ -20,13 +20,14 @@ static const int kMaxDepth = 64;
 static const NSInteger kBadgeTag = 0x52454444;
 static BOOL blurEnabled = YES;
 static const CGFloat kMinMediaWidth = 100;
-static const CGFloat kBlurredDetailLimit = 3;
+static const CGFloat kBlurredDetailLimit = 5;
 enum { kDetailSide = 64 };
 static NSMutableDictionary<NSString *, NSArray<NSString *> *> *clearAddressesByTitle;
 static NSCache<NSString *, UIImage *> *revealedImages;
 static char kImageDetailKey;
 static char kClearAddressesKey;
 static char kRecheckPendingKey;
+static char kFeedMediaKey;
 // Newest platform version this app version can be expected to accept; see processJSON.
 static NSString *const kGamePlatformVersion = @"0.12.0";
 static NSString *const kGameClientVersion = @"2026.44.0";
@@ -344,6 +345,11 @@ static void logBadgeState(UIView *media, UILabel *badge, NSUInteger addresses, C
 
 static void logTap(void) { writeLog(@"TAP badge"); }
 
+static void logRevealApplied(NSUInteger page, NSUInteger views, NSUInteger updated) {
+  writeLog([NSString stringWithFormat:@"REVEALSET page=%lu views=%lu updated=%lu", (unsigned long)page,
+                                      (unsigned long)views, (unsigned long)updated]);
+}
+
 static void logReveal(NSUInteger index, BOOL decoded) {
   writeLog([NSString stringWithFormat:@"REVEAL page=%lu decoded=%d", (unsigned long)index, decoded]);
 }
@@ -537,6 +543,7 @@ static inline void logFeedStackFound(BOOL found) {}
 static inline void logBadgeState(UIView *media, UILabel *badge, NSUInteger addresses, CGFloat detail) {}
 static inline void logReveal(NSUInteger index, BOOL decoded) {}
 static inline void logTap(void) {}
+static inline void logRevealApplied(NSUInteger page, NSUInteger views, NSUInteger updated) {}
 static inline void testActiveCountSources(NSURLRequest *source, NSString *operation) {}
 static inline void logDetail(UIView *media, CGFloat detail, BOOL isTagged) {}
 static inline void probeOnlineCount(NSURLRequest *source) {}
@@ -799,8 +806,14 @@ static void revealImagesIn(UIView *media, UILabel *badge) {
             [revealedImages setObject:image forKey:address];
             NSMutableArray<UIImageView *> *imageViews = [NSMutableArray array];
             collectImageViews(weakMedia, imageViews, 0);
-            for (UIImageView *imageView in imageViews)
-              if (pageIndexOfImageView(imageView) == index) imageView.image = image;
+            NSUInteger updated = 0;
+            for (UIImageView *imageView in imageViews) {
+              if (pageIndexOfImageView(imageView) == index) {
+                imageView.image = image;
+                updated++;
+              }
+            }
+            logRevealApplied(index, imageViews.count, updated);
           });
         }] resume];
   }
@@ -848,15 +861,30 @@ static void scheduleBadgeRecheck(UILabel *badge) {
   });
 }
 
-// Blurred clips play under the blur with nothing to see, so they stay paused behind the badge.
-static void pausePlayersIn(UIView *view, int depth) {
-  if (depth > 10) return;
+static AVPlayerLayer *playerLayerIn(CALayer *layer, int depth) {
   Class playerLayerClass = NSClassFromString(@"AVPlayerLayer");
-  if ([view.layer isKindOfClass:playerLayerClass]) {
-    AVPlayer *player = ((AVPlayerLayer *)view.layer).player;
-    if (player.rate != 0) [player pause];
+  if ([layer isKindOfClass:playerLayerClass]) return (AVPlayerLayer *)layer;
+  if (depth > 3) return nil;
+  for (CALayer *sublayer in layer.sublayers) {
+    AVPlayerLayer *found = playerLayerIn(sublayer, depth + 1);
+    if (found) return found;
   }
-  for (UIView *child in view.subviews) pausePlayersIn(child, depth + 1);
+  return nil;
+}
+
+// Only the poster of a clip is blurred: the player draws the clear video over it. So the player
+// view stays hidden and paused behind the badge, leaving the blurred poster visible.
+static void setClipBlocked(UIView *view, BOOL blocked, int depth) {
+  if (depth > 10) return;
+  if ([NSStringFromClass(view.class) containsString:@"PlayerLayerView"]) {
+    view.hidden = blocked;
+    if (blocked) {
+      AVPlayer *player = playerLayerIn(view.layer, 0).player;
+      if (player.rate != 0) [player pause];
+    }
+    return;
+  }
+  for (UIView *child in view.subviews) setClipBlocked(child, blocked, depth + 1);
 }
 
 // The badge shows only over a post's image that really looks blurred, so one the app already
@@ -865,11 +893,15 @@ static void pausePlayersIn(UIView *view, int depth) {
 static void updateAdultBadge(UIView *media, BOOL isTagged, NSArray<NSString *> *addresses) {
   static RedditLegacyBadgeTarget *target;
   if (!target) target = [RedditLegacyBadgeTarget new];
+  // Clips open in the app's own player; only images can be cleared in place.
+  BOOL isClip = [NSStringFromClass(media.class) containsString:@"LegacyVideo"];
+  if (isClip) addresses = nil;
   NSMutableArray<UIImageView *> *imageViews = [NSMutableArray array];
   collectImageViews(media, imageViews, 0);
   BOOL isBlurred = NO;
   CGFloat lowestDetail = CGFLOAT_MAX;
   for (UIImageView *imageView in imageViews) {
+    objc_setAssociatedObject(imageView, &kFeedMediaKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     NSUInteger index = pageIndexOfImageView(imageView);
     UIImage *revealed = index < addresses.count ? [revealedImages objectForKey:addresses[index]] : nil;
     if (revealed) {
@@ -884,6 +916,7 @@ static void updateAdultBadge(UIView *media, BOOL isTagged, NSArray<NSString *> *
   if (lowestDetail < CGFLOAT_MAX) logDetail(media, lowestDetail, isTagged);
   BOOL show = isTagged && isBlurred;
   UILabel *badge = (UILabel *)[media viewWithTag:kBadgeTag];
+  if (isClip) setClipBlocked(media, show, 0);
   if (!show) {
     badge.hidden = YES;
     return;
@@ -919,7 +952,6 @@ static void updateAdultBadge(UIView *media, BOOL isTagged, NSArray<NSString *> *
   objc_setAssociatedObject(badge, &kClearAddressesKey, addresses, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
   badge.userInteractionEnabled = addresses.count > 0;
   scheduleBadgeRecheck(badge);
-  if ([NSStringFromClass(media.class) containsString:@"LegacyVideo"]) pausePlayersIn(media, 0);
   logBadgeState(media, badge, addresses.count, lowestDetail);
 }
 
@@ -980,6 +1012,20 @@ static void refreshAdultBadges(UIView *stack) {
   updateAdultBadges(stack, blurEnabled && hasAdultTag(stack, 0), clearAddressesInStack(stack, 0), 0);
 }
 
+// The online dot would stay alone next to the emptied count.
+static void hideOnlineDot(UILabel *label) {
+  __weak UILabel *weakLabel = label;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    UIView *parent = weakLabel.superview;
+    for (UIView *sibling in parent.subviews) {
+      CGSize size = sibling.bounds.size;
+      if (sibling != weakLabel && ![sibling isKindOfClass:UILabel.class] && size.width > 0 && size.width <= 14 &&
+          size.height > 0 && size.height <= 14)
+        sibling.hidden = YES;
+    }
+  });
+}
+
 static BOOL isZeroOnline(NSString *text) {
   return text.length > 0 && text.length <= 60 && matches(zeroOnlineText, text);
 }
@@ -1002,16 +1048,34 @@ static BOOL isZeroOnline(NSString *text) {
 }
 %end
 
+%hook UIImageView
+- (void)setImage:(UIImage *)image {
+  %orig;
+  if (!objc_getAssociatedObject(self, &kFeedMediaKey)) return;
+  __weak UIView *weakView = self;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    Class feedStack = NSClassFromString(@"FeedKit_Slices.FeedStackSliceView");
+    UIView *view = weakView;
+    while (view && ![view isKindOfClass:feedStack]) view = view.superview;
+    if (view) refreshAdultBadges(view);
+  });
+}
+%end
+
 %hook UILabel
 // Reddit no longer sends an online count, so the app always shows zero. Emptying the text
 // also survives the app toggling the label's visibility, and reused cells simply get new text.
 - (void)setText:(NSString *)text {
   logLabel(self, text);
-  %orig(isZeroOnline(text) ? @"" : text);
+  BOOL isZero = isZeroOnline(text);
+  %orig(isZero ? @"" : text);
+  if (isZero) hideOnlineDot(self);
 }
 - (void)setAttributedText:(NSAttributedString *)text {
   logLabel(self, text.string);
-  %orig(isZeroOnline(text.string) ? [[NSAttributedString alloc] initWithString:@""] : text);
+  BOOL isZero = isZeroOnline(text.string);
+  %orig(isZero ? [[NSAttributedString alloc] initWithString:@""] : text);
+  if (isZero) hideOnlineDot(self);
 }
 %end
 
