@@ -275,6 +275,8 @@ static NSString *describeValue(id value) {
   return nil;
 }
 
+static void logInitialRender(NSString *value);
+
 static void logField(NSString *key, NSString *keyPath, id value, NSString *operation) {
   if ([value isKindOfClass:NSString.class]) {
     BOOL isGameVersion = [keyPath containsString:@"devvit"] && [key isEqualToString:@"version"];
