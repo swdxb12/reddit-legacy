@@ -1,0 +1,18 @@
+{
+  "minVersion": "0.4",
+  "class": "DepictionTabView",
+  "headerImage": "https://swdxb12.github.io/reddit-legacy/package/header.jpg",
+  "tintColor": "#FF4500",
+  "tabs": [
+    {
+      "tabname": "Details",
+      "class": "DepictionStackView",
+      "views": [
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "Keeps the official Reddit app usable on iOS 15. Tested with Reddit 2025.32 and Dopamine.\n\n- Removes ads from the feed\n- Removes the NSFW banner and keeps the blur\n- Removes the \"0 online\" count, which Reddit no longer sends"
+        }
+      ]
+    }
+  ]
+}
