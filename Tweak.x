@@ -1,11 +1,10 @@
 // RedditLegacy: keeps the official Reddit app usable on iOS 15.
 //  - Removes the NSFW label from subreddits in GraphQL responses (banner); posts keep theirs (blur).
 //  - Blanks the "0 online" label, a count the server no longer provides.
-//  - Blurs media inside NSFW subreddits, as the home feed already does.
 //  - Removes ads from GraphQL responses.
 //  - Reports a current version to Reddit's game servers.
 //  - Blurs all 18+ feed media with a "View 18+ content" cover; a tap reveals that post in place.
-//  - Holding a clip in the feed, or its "more actions" sheet, offers to save it to Photos.
+//  - The "more actions" sheet of a post with a clip offers to save it to Photos.
 //
 // Development builds (without RELEASE=1) also write and upload a diagnostics log: field names,
 // numbers, booleans, API error messages, screen classes and short on-screen labels matching
@@ -29,7 +28,6 @@ static NSMutableDictionary<NSString *, NSArray<NSString *> *> *clearAddressesByT
 static NSCache<NSString *, UIImage *> *revealedImages;
 static NSMutableSet<NSString *> *revealedPosts;
 static NSMutableDictionary<NSString *, NSDictionary *> *clipsByTitle;
-static char kLongPressKey;
 static char kRowClipKey;
 static __weak UIView *lastTouchedStack;
 static char kPostKey;
@@ -668,9 +666,9 @@ static NSString *normalizedTitle(NSString *title) {
 
 static void addClearAddress(id source, NSMutableArray<NSString *> *addresses) {
   if (![source isKindOfClass:NSDictionary.class]) return;
-  NSString *blurred = source[@"obfuscatedPath"];
+  // Only media the server really marked as blurred needs its clear image fetched on reveal.
   NSString *clear = source[@"path"];
-  if ([blurred isKindOfClass:NSString.class] && blurred.length && [clear isKindOfClass:NSString.class] && clear.length)
+  if ([source[@"isObfuscated"] isEqual:@YES] && [clear isKindOfClass:NSString.class] && clear.length)
     [addresses addObject:clear];
 }
 
@@ -746,16 +744,6 @@ static BOOL processJSON(id object, NSString *path, NSString *operation, int dept
       } else if (processJSON(value, keyPath, operation, depth + 1)) {
         changed = YES;
       }
-    }
-    // Inside NSFW subreddits the server sends a blurred copy but marks the media as not
-    // obfuscated, unlike the home feed. Marking it makes the app use that copy there too.
-    id blurredCopy = dict[@"obfuscatedPath"];
-    id isObfuscated = dict[@"isObfuscated"];
-    BOOL hasBlurredCopy = [blurredCopy isKindOfClass:NSString.class] && [blurredCopy length] > 0;
-    if (hasBlurredCopy && [isObfuscated isKindOfClass:NSNumber.class] && ![isObfuscated boolValue] &&
-        [dict isKindOfClass:NSMutableDictionary.class]) {
-      dict[@"isObfuscated"] = @YES;
-      changed = YES;
     }
     // Clips are covered on screen instead. Left marked, the app keeps its own blur over the video,
     // which stays after the cover is removed.
@@ -954,40 +942,39 @@ typedef NS_ENUM(NSUInteger, DownloadText) {
   DownloadTextProgress,
   DownloadTextSaved,
   DownloadTextFailed,
-  DownloadTextCancel,
 };
 
 static NSString *downloadText(DownloadText which) {
   NSDictionary<NSString *, NSArray<NSString *> *> *texts = @{
-    @"ar" : @[ @"تنزيل GIF", @"تنزيل الفيديو", @"جارٍ التنزيل…", @"تم الحفظ في الصور", @"تعذر التنزيل", @"إلغاء" ],
-    @"cs" : @[ @"Stáhnout GIF", @"Stáhnout video", @"Stahování…", @"Uloženo do Fotek", @"Stažení se nezdařilo", @"Zrušit" ],
-    @"da" : @[ @"Download GIF", @"Download video", @"Downloader…", @"Gemt i Fotos", @"Kunne ikke downloade", @"Annuller" ],
-    @"de" : @[ @"GIF laden", @"Video laden", @"Wird geladen…", @"In Fotos gesichert", @"Download fehlgeschlagen", @"Abbrechen" ],
-    @"el" : @[ @"Λήψη GIF", @"Λήψη βίντεο", @"Λήψη…", @"Αποθηκεύτηκε στις Φωτογραφίες", @"Η λήψη απέτυχε", @"Ακύρωση" ],
-    @"en" : @[ @"Download GIF", @"Download video", @"Downloading…", @"Saved to Photos", @"Download failed", @"Cancel" ],
-    @"es" : @[ @"Descargar GIF", @"Descargar vídeo", @"Descargando…", @"Guardado en Fotos", @"No se pudo descargar", @"Cancelar" ],
-    @"fi" : @[ @"Lataa GIF", @"Lataa video", @"Ladataan…", @"Tallennettu Kuviin", @"Lataus epäonnistui", @"Kumoa" ],
-    @"fr" : @[ @"Télécharger le GIF", @"Télécharger la vidéo", @"Téléchargement…", @"Enregistré dans Photos", @"Échec du téléchargement", @"Annuler" ],
-    @"he" : @[ @"הורדת GIF", @"הורדת וידאו", @"מוריד…", @"נשמר בתמונות", @"ההורדה נכשלה", @"ביטול" ],
-    @"hi" : @[ @"GIF डाउनलोड करें", @"वीडियो डाउनलोड करें", @"डाउनलोड हो रहा है…", @"Photos में सहेजा गया", @"डाउनलोड विफल", @"रद्द करें" ],
-    @"hu" : @[ @"GIF letöltése", @"Videó letöltése", @"Letöltés…", @"Mentve a Fotókba", @"A letöltés sikertelen", @"Mégse" ],
-    @"id" : @[ @"Unduh GIF", @"Unduh video", @"Mengunduh…", @"Disimpan ke Foto", @"Gagal mengunduh", @"Batal" ],
-    @"it" : @[ @"Scarica GIF", @"Scarica video", @"Download…", @"Salvato in Foto", @"Download non riuscito", @"Annulla" ],
-    @"ja" : @[ @"GIFをダウンロード", @"動画をダウンロード", @"ダウンロード中…", @"写真に保存しました", @"ダウンロードに失敗しました", @"キャンセル" ],
-    @"ko" : @[ @"GIF 다운로드", @"동영상 다운로드", @"다운로드 중…", @"사진에 저장됨", @"다운로드 실패", @"취소" ],
-    @"nb" : @[ @"Last ned GIF", @"Last ned video", @"Laster ned…", @"Lagret i Bilder", @"Nedlasting mislyktes", @"Avbryt" ],
-    @"nl" : @[ @"GIF downloaden", @"Video downloaden", @"Downloaden…", @"Bewaard in Foto's", @"Downloaden mislukt", @"Annuleer" ],
-    @"pl" : @[ @"Pobierz GIF", @"Pobierz wideo", @"Pobieranie…", @"Zapisano w Zdjęciach", @"Nie udało się pobrać", @"Anuluj" ],
-    @"pt" : @[ @"Baixar GIF", @"Baixar vídeo", @"Baixando…", @"Salvo em Fotos", @"Falha ao baixar", @"Cancelar" ],
-    @"ro" : @[ @"Descarcă GIF", @"Descarcă video", @"Se descarcă…", @"Salvat în Poze", @"Descărcare eșuată", @"Anulează" ],
-    @"ru" : @[ @"Скачать GIF", @"Скачать видео", @"Загрузка…", @"Сохранено в Фото", @"Не удалось скачать", @"Отмена" ],
-    @"sv" : @[ @"Ladda ner GIF", @"Ladda ner video", @"Laddar ner…", @"Sparat i Bilder", @"Nedladdningen misslyckades", @"Avbryt" ],
-    @"th" : @[ @"ดาวน์โหลด GIF", @"ดาวน์โหลดวิดีโอ", @"กำลังดาวน์โหลด…", @"บันทึกลงในรูปภาพแล้ว", @"ดาวน์โหลดไม่สำเร็จ", @"ยกเลิก" ],
-    @"tr" : @[ @"GIF'i indir", @"Videoyu indir", @"İndiriliyor…", @"Fotoğraflar'a kaydedildi", @"İndirilemedi", @"Vazgeç" ],
-    @"uk" : @[ @"Завантажити GIF", @"Завантажити відео", @"Завантаження…", @"Збережено у Фото", @"Не вдалося завантажити", @"Скасувати" ],
-    @"vi" : @[ @"Tải GIF", @"Tải video", @"Đang tải…", @"Đã lưu vào Ảnh", @"Không tải được", @"Hủy" ],
-    @"zh-Hans" : @[ @"下载 GIF", @"下载视频", @"正在下载…", @"已存储到照片", @"下载失败", @"取消" ],
-    @"zh-Hant" : @[ @"下載 GIF", @"下載影片", @"正在下載…", @"已儲存到照片", @"下載失敗", @"取消" ],
+    @"ar" : @[ @"تنزيل GIF", @"تنزيل الفيديو", @"جارٍ التنزيل…", @"تم الحفظ في الصور", @"تعذر التنزيل" ],
+    @"cs" : @[ @"Stáhnout GIF", @"Stáhnout video", @"Stahování…", @"Uloženo do Fotek", @"Stažení se nezdařilo" ],
+    @"da" : @[ @"Download GIF", @"Download video", @"Downloader…", @"Gemt i Fotos", @"Kunne ikke downloade" ],
+    @"de" : @[ @"GIF laden", @"Video laden", @"Wird geladen…", @"In Fotos gesichert", @"Download fehlgeschlagen" ],
+    @"el" : @[ @"Λήψη GIF", @"Λήψη βίντεο", @"Λήψη…", @"Αποθηκεύτηκε στις Φωτογραφίες", @"Η λήψη απέτυχε" ],
+    @"en" : @[ @"Download GIF", @"Download video", @"Downloading…", @"Saved to Photos", @"Download failed" ],
+    @"es" : @[ @"Descargar GIF", @"Descargar vídeo", @"Descargando…", @"Guardado en Fotos", @"No se pudo descargar" ],
+    @"fi" : @[ @"Lataa GIF", @"Lataa video", @"Ladataan…", @"Tallennettu Kuviin", @"Lataus epäonnistui" ],
+    @"fr" : @[ @"Télécharger le GIF", @"Télécharger la vidéo", @"Téléchargement…", @"Enregistré dans Photos", @"Échec du téléchargement" ],
+    @"he" : @[ @"הורדת GIF", @"הורדת וידאו", @"מוריד…", @"נשמר בתמונות", @"ההורדה נכשלה" ],
+    @"hi" : @[ @"GIF डाउनलोड करें", @"वीडियो डाउनलोड करें", @"डाउनलोड हो रहा है…", @"Photos में सहेजा गया", @"डाउनलोड विफल" ],
+    @"hu" : @[ @"GIF letöltése", @"Videó letöltése", @"Letöltés…", @"Mentve a Fotókba", @"A letöltés sikertelen" ],
+    @"id" : @[ @"Unduh GIF", @"Unduh video", @"Mengunduh…", @"Disimpan ke Foto", @"Gagal mengunduh" ],
+    @"it" : @[ @"Scarica GIF", @"Scarica video", @"Download…", @"Salvato in Foto", @"Download non riuscito" ],
+    @"ja" : @[ @"GIFをダウンロード", @"動画をダウンロード", @"ダウンロード中…", @"写真に保存しました", @"ダウンロードに失敗しました" ],
+    @"ko" : @[ @"GIF 다운로드", @"동영상 다운로드", @"다운로드 중…", @"사진에 저장됨", @"다운로드 실패" ],
+    @"nb" : @[ @"Last ned GIF", @"Last ned video", @"Laster ned…", @"Lagret i Bilder", @"Nedlasting mislyktes" ],
+    @"nl" : @[ @"GIF downloaden", @"Video downloaden", @"Downloaden…", @"Bewaard in Foto's", @"Downloaden mislukt" ],
+    @"pl" : @[ @"Pobierz GIF", @"Pobierz wideo", @"Pobieranie…", @"Zapisano w Zdjęciach", @"Nie udało się pobrać" ],
+    @"pt" : @[ @"Baixar GIF", @"Baixar vídeo", @"Baixando…", @"Salvo em Fotos", @"Falha ao baixar" ],
+    @"ro" : @[ @"Descarcă GIF", @"Descarcă video", @"Se descarcă…", @"Salvat în Poze", @"Descărcare eșuată" ],
+    @"ru" : @[ @"Скачать GIF", @"Скачать видео", @"Загрузка…", @"Сохранено в Фото", @"Не удалось скачать" ],
+    @"sv" : @[ @"Ladda ner GIF", @"Ladda ner video", @"Laddar ner…", @"Sparat i Bilder", @"Nedladdningen misslyckades" ],
+    @"th" : @[ @"ดาวน์โหลด GIF", @"ดาวน์โหลดวิดีโอ", @"กำลังดาวน์โหลด…", @"บันทึกลงในรูปภาพแล้ว", @"ดาวน์โหลดไม่สำเร็จ" ],
+    @"tr" : @[ @"GIF'i indir", @"Videoyu indir", @"İndiriliyor…", @"Fotoğraflar'a kaydedildi", @"İndirilemedi" ],
+    @"uk" : @[ @"Завантажити GIF", @"Завантажити відео", @"Завантаження…", @"Збережено у Фото", @"Не вдалося завантажити" ],
+    @"vi" : @[ @"Tải GIF", @"Tải video", @"Đang tải…", @"Đã lưu vào Ảnh", @"Không tải được" ],
+    @"zh-Hans" : @[ @"下载 GIF", @"下载视频", @"正在下载…", @"已存储到照片", @"下载失败" ],
+    @"zh-Hant" : @[ @"下載 GIF", @"下載影片", @"正在下載…", @"已儲存到照片", @"下載失敗" ],
   };
   NSArray<NSString *> *strings = texts[appLanguageKey(texts)] ?: texts[@"en"];
   return strings[which];
@@ -1184,17 +1171,6 @@ static void downloadClip(NSDictionary *clip) {
   });
 }
 
-static UIView *clipContainerAtPoint(UIView *view, UIView *stack, CGPoint point, int depth) {
-  if (depth > 6) return nil;
-  if ([NSStringFromClass(view.class) containsString:@"LegacyVideo"] && isBlurredMediaContainer(view))
-    return [view pointInside:[stack convertPoint:point toView:view] withEvent:nil] ? view : nil;
-  for (UIView *child in view.subviews) {
-    UIView *found = clipContainerAtPoint(child, stack, point, depth + 1);
-    if (found) return found;
-  }
-  return nil;
-}
-
 static UIViewController *controllerOfView(UIView *view) {
   for (UIResponder *responder = view; responder; responder = responder.nextResponder) {
     if ([responder isKindOfClass:UIViewController.class]) return (UIViewController *)responder;
@@ -1212,25 +1188,8 @@ static NSDictionary *clipOfStack(UIView *stack) {
   }
 }
 
-static void presentDownloadMenu(UIView *stack, CGPoint point) {
-  if (!clipContainerAtPoint(stack, stack, point, 0)) return;
-  NSDictionary *clip = clipOfStack(stack);
-  logDownload([NSString stringWithFormat:@"menu clip=%d", clip != nil]);
-  if (!clip) return;
-  UIViewController *controller = controllerOfView(stack);
-  if (!controller) return;
-  UIAlertController *menu = [UIAlertController alertControllerWithTitle:nil message:nil preferredStyle:UIAlertControllerStyleActionSheet];
-  NSString *title = downloadText([clip[@"isGif"] boolValue] ? DownloadTextGif : DownloadTextVideo);
-  [menu addAction:[UIAlertAction actionWithTitle:title
-                                           style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *action) { downloadClip(clip); }]];
-  [menu addAction:[UIAlertAction actionWithTitle:downloadText(DownloadTextCancel) style:UIAlertActionStyleCancel handler:nil]];
-  [controller presentViewController:menu animated:YES completion:nil];
-}
-
 @interface RedditLegacyCoverTarget : NSObject
 - (void)coverTapped:(UITapGestureRecognizer *)recognizer;
-- (void)stackLongPressed:(UILongPressGestureRecognizer *)recognizer;
 - (void)downloadRowTapped:(UIControl *)row;
 @end
 
@@ -1241,10 +1200,6 @@ static void presentDownloadMenu(UIView *stack, CGPoint point) {
   while (sheet.parentViewController) sheet = sheet.parentViewController;
   if (!clip || !sheet) return;
   [sheet dismissViewControllerAnimated:YES completion:^{ downloadClip(clip); }];
-}
-- (void)stackLongPressed:(UILongPressGestureRecognizer *)recognizer {
-  if (recognizer.state != UIGestureRecognizerStateBegan) return;
-  presentDownloadMenu(recognizer.view, [recognizer locationInView:recognizer.view]);
 }
 - (void)coverTapped:(UITapGestureRecognizer *)recognizer {
   UIView *cover = recognizer.view;
@@ -1531,16 +1486,6 @@ static void offerDownloadInSheet(UIViewController *sheet) {
   }
 }
 
-static void installLongPress(UIView *stack) {
-  if (objc_getAssociatedObject(stack, &kLongPressKey)) return;
-  objc_setAssociatedObject(stack, &kLongPressKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-  static RedditLegacyCoverTarget *target;
-  if (!target) target = [RedditLegacyCoverTarget new];
-  UILongPressGestureRecognizer *press = [[UILongPressGestureRecognizer alloc] initWithTarget:target action:@selector(stackLongPressed:)];
-  press.cancelsTouchesInView = NO;
-  [stack addGestureRecognizer:press];
-}
-
 static void refreshAdultBadges(UIView *stack) {
   NSString *longest = nil;
   NSString *key = findPostKey(stack, &longest, 0) ?: longest;
@@ -1644,7 +1589,6 @@ static BOOL isZeroOnline(UILabel *label, NSString *text) {
 - (void)layoutSubviews {
   %orig;
   UIView *stack = (UIView *)self;
-  installLongPress(stack);
   refreshAdultBadges(stack);
   // The 18+ tag and the image address arrive after this layout pass, so they are checked again.
   __weak UIView *weakStack = stack;
