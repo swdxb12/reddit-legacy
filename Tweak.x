@@ -367,7 +367,49 @@ static void logAd(NSString *path, NSString *operation, NSString *kind) {
 
 // Records the shape of feed cells and blurred media as the server sent them. Strings are only
 // kept for type-like fields, so titles and usernames stay out of the log.
+static NSString *describeAddress(id value) {
+  if (![value isKindOfClass:NSString.class]) return @"-";
+  NSURL *url = [NSURL URLWithString:value];
+  return [NSString stringWithFormat:@"%@/.%@", url.host ?: @"?", url.pathExtension ?: @""];
+}
+
+static void collectAddressesOf(id object, NSString *path, NSMutableArray<NSString *> *found, int depth) {
+  if (depth > 6) return;
+  if ([object isKindOfClass:NSDictionary.class]) {
+    for (NSString *key in (NSDictionary *)object)
+      collectAddressesOf(object[key], [path stringByAppendingFormat:@".%@", key], found, depth + 1);
+  } else if ([object isKindOfClass:NSArray.class]) {
+    id first = [(NSArray *)object firstObject];
+    if (first) collectAddressesOf(first, path, found, depth + 1);
+  } else if ([object isKindOfClass:NSString.class] && [object hasPrefix:@"http"]) {
+    [found addObject:[NSString stringWithFormat:@"%@=%@", path, describeAddress(object)]];
+  }
+}
+
+// Shows which addresses a clip offers, to find one that can be saved as a file.
+static void logVideoCell(NSDictionary *cell) {
+  NSMutableArray<NSString *> *addresses = [NSMutableArray array];
+  collectAddressesOf(cell, @"", addresses, 0);
+  writeLog([NSString stringWithFormat:@"VIDEOSRC gif=%@ type=%@ %@", cell[@"isGif"], cell[@"type"],
+                                      [addresses componentsJoinedByString:@" "]]);
+}
+
+static void logPresented(UIViewController *controller) {
+  writeLog([NSString stringWithFormat:@"PRESENT %@", NSStringFromClass(controller.class)]);
+  if ([controller isKindOfClass:UIAlertController.class]) {
+    NSMutableArray<NSString *> *titles = [NSMutableArray array];
+    for (UIAlertAction *action in ((UIAlertController *)controller).actions)
+      [titles addObject:action.title ?: @"-"];
+    writeLog([NSString stringWithFormat:@"ALERTMENU %@", [titles componentsJoinedByString:@" | "]]);
+  }
+}
+
+static void logContextMenu(id delegate) {
+  writeLog([NSString stringWithFormat:@"CONTEXTMENU delegate=%@", NSStringFromClass([delegate class])]);
+}
+
 static void logStructure(NSDictionary *dict, NSString *path, NSString *operation) {
+  if ([dict[@"__typename"] isEqual:@"LegacyVideoCell"]) logVideoCell(dict);
   BOOL isMedia = dict[@"isObfuscated"] != nil;
   BOOL isFeedCell = dict[@"__typename"] != nil && [operation hasSuffix:@"Sdui"];
   if (!isMedia && !isFeedCell) return;
@@ -501,7 +543,7 @@ static void startDiagnostics(NSString *path) {
   interestingLabel = [NSRegularExpression
       regularExpressionWithPattern:@"nsfw|online|conectad|en l[ií]nea|18\\+|adult|mature|madur|sensible|"
                                    @"visitant|visitor|usuario|users|miembro|member|contribu|"
-                                   @"uh oh|upgrade|latest version|actualiz|"
+                                   @"uh oh|upgrade|latest version|actualiz|guardar|save|descarg|download|compartir|share|copiar|copy|"
                                    @"\\b(ver|verla|toca|tocar|click|clic|pulsa|mostrar|show|view|reveal|tap)\\b"
                            options:NSRegularExpressionCaseInsensitive
                              error:nil];
@@ -540,6 +582,8 @@ static inline void logFeedStackFound(BOOL found) {}
 static inline void logCoverState(UIView *media, BOOL covered, NSUInteger addresses) {}
 static inline void logReveal(NSUInteger index, BOOL decoded) {}
 static inline void logTap(void) {}
+static inline void logPresented(UIViewController *controller) {}
+static inline void logContextMenu(id delegate) {}
 static inline void logClipBlurHidden(void) {}
 static inline void logRevealApplied(NSUInteger page, NSUInteger views, NSUInteger updated) {}
 static inline void testActiveCountSources(NSURLRequest *source, NSString *operation) {}
@@ -1239,7 +1283,18 @@ static BOOL isZeroOnline(UILabel *label, NSString *text) {
 }
 %end
 
+%hook UIContextMenuInteraction
+- (instancetype)initWithDelegate:(id)delegate {
+  logContextMenu(delegate);
+  return %orig;
+}
+%end
+
 %hook UIViewController
+- (void)presentViewController:(UIViewController *)controller animated:(BOOL)animated completion:(id)completion {
+  logPresented(controller);
+  %orig;
+}
 - (void)viewDidAppear:(BOOL)animated {
   %orig;
   logScreen(self);
