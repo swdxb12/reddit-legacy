@@ -5,7 +5,7 @@
 //  - Removes ads from GraphQL responses.
 //  - Reports a current version to Reddit's game servers.
 //  - Blurs all 18+ feed media with a "View 18+ content" cover; a tap reveals that post in place.
-//  - Holding a clip in the feed offers to save it to Photos.
+//  - Holding a clip in the feed, or its "more actions" sheet, offers to save it to Photos.
 //
 // Development builds (without RELEASE=1) also write and upload a diagnostics log: field names,
 // numbers, booleans, API error messages, screen classes and short on-screen labels matching
@@ -20,6 +20,8 @@
 static const NSUInteger kMaxJSONBytes = 20 * 1024 * 1024;
 static const int kMaxDepth = 64;
 static const NSInteger kCoverTag = 0x52454444;
+static const NSInteger kDownloadRowTag = 0x52454445;
+static const CGFloat kDownloadRowHeight = 48;
 static BOOL blurEnabled = YES;
 static const CGFloat kMinMediaWidth = 100;
 static const CGFloat kMinThumbnailWidth = 40;
@@ -28,6 +30,8 @@ static NSCache<NSString *, UIImage *> *revealedImages;
 static NSMutableSet<NSString *> *revealedPosts;
 static NSMutableDictionary<NSString *, NSDictionary *> *clipsByTitle;
 static char kLongPressKey;
+static char kRowClipKey;
+static __weak UIView *lastTouchedStack;
 static char kPostKey;
 static char kFeedMediaKey;
 // Newest platform version this app version can be expected to accept; see processJSON.
@@ -1198,14 +1202,19 @@ static UIViewController *controllerOfView(UIView *view) {
   return nil;
 }
 
-static void presentDownloadMenu(UIView *stack, CGPoint point) {
-  if (!clipContainerAtPoint(stack, stack, point, 0)) return;
+static NSDictionary *clipOfStack(UIView *stack) {
+  if (!stack) return nil;
   NSString *longest = nil;
   NSString *key = findPostKey(stack, &longest, 0);
-  NSDictionary *clip = nil;
+  if (!key) return nil;
   @synchronized(clearAddressesByTitle) {
-    clip = key ? clipsByTitle[key] : nil;
+    return clipsByTitle[key];
   }
+}
+
+static void presentDownloadMenu(UIView *stack, CGPoint point) {
+  if (!clipContainerAtPoint(stack, stack, point, 0)) return;
+  NSDictionary *clip = clipOfStack(stack);
   logDownload([NSString stringWithFormat:@"menu clip=%d", clip != nil]);
   if (!clip) return;
   UIViewController *controller = controllerOfView(stack);
@@ -1222,9 +1231,17 @@ static void presentDownloadMenu(UIView *stack, CGPoint point) {
 @interface RedditLegacyCoverTarget : NSObject
 - (void)coverTapped:(UITapGestureRecognizer *)recognizer;
 - (void)stackLongPressed:(UILongPressGestureRecognizer *)recognizer;
+- (void)downloadRowTapped:(UIControl *)row;
 @end
 
 @implementation RedditLegacyCoverTarget
+- (void)downloadRowTapped:(UIControl *)row {
+  NSDictionary *clip = objc_getAssociatedObject(row, &kRowClipKey);
+  UIViewController *sheet = controllerOfView(row);
+  while (sheet.parentViewController) sheet = sheet.parentViewController;
+  if (!clip || !sheet) return;
+  [sheet dismissViewControllerAnimated:YES completion:^{ downloadClip(clip); }];
+}
 - (void)stackLongPressed:(UILongPressGestureRecognizer *)recognizer {
   if (recognizer.state != UIGestureRecognizerStateBegan) return;
   presentDownloadMenu(recognizer.view, [recognizer locationInView:recognizer.view]);
@@ -1438,6 +1455,82 @@ static UIView *visibleCoverAtPoint(UIView *view, UIView *stack, CGPoint point, i
   return nil;
 }
 
+static UICollectionView *firstCollectionView(UIView *view, int depth) {
+  if ([view isKindOfClass:UICollectionView.class]) return (UICollectionView *)view;
+  if (depth > 10) return nil;
+  for (UIView *child in view.subviews) {
+    UICollectionView *found = firstCollectionView(child, depth + 1);
+    if (found) return found;
+  }
+  return nil;
+}
+
+// Copies the look of the sheet's own rows.
+static UILabel *firstRowLabel(UIView *view, int depth) {
+  if ([view isKindOfClass:UILabel.class] && [NSStringFromClass(view.superview.class) containsString:@"LabelSliceView"]) return (UILabel *)view;
+  if (depth > 10) return nil;
+  for (UIView *child in view.subviews) {
+    UILabel *found = firstRowLabel(child, depth + 1);
+    if (found) return found;
+  }
+  return nil;
+}
+
+// The sheet's rows are built from Swift data this tweak can't add to, so the row sits above them
+// in space opened at the top of the list.
+static void addDownloadRow(UICollectionView *list, NSDictionary *clip) {
+  if ([list viewWithTag:kDownloadRowTag]) return;
+  static RedditLegacyCoverTarget *target;
+  if (!target) target = [RedditLegacyCoverTarget new];
+  UILabel *model = firstRowLabel(list, 0);
+  UIColor *color = model.textColor ?: UIColor.labelColor;
+  UIControl *row = [[UIControl alloc] initWithFrame:CGRectMake(0, -kDownloadRowHeight, CGRectGetWidth(list.bounds), kDownloadRowHeight)];
+  row.tag = kDownloadRowTag;
+  row.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+  objc_setAssociatedObject(row, &kRowClipKey, clip, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  [row addTarget:target action:@selector(downloadRowTapped:) forControlEvents:UIControlEventTouchUpInside];
+
+  UIImageSymbolConfiguration *symbol = [UIImageSymbolConfiguration configurationWithPointSize:18];
+  UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"arrow.down.to.line" withConfiguration:symbol]];
+  icon.tintColor = color;
+  icon.contentMode = UIViewContentModeCenter;
+  icon.frame = CGRectMake(16, 0, 24, kDownloadRowHeight);
+  icon.userInteractionEnabled = NO;
+  [row addSubview:icon];
+
+  UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(44, 0, CGRectGetWidth(list.bounds) - 60, kDownloadRowHeight)];
+  label.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+  label.font = model.font ?: [UIFont systemFontOfSize:16];
+  label.textColor = color;
+  label.text = downloadText([clip[@"isGif"] boolValue] ? DownloadTextGif : DownloadTextVideo);
+  label.userInteractionEnabled = NO;
+  [row addSubview:label];
+
+  [list addSubview:row];
+  UIEdgeInsets insets = list.contentInset;
+  insets.top += kDownloadRowHeight;
+  list.contentInset = insets;
+  list.contentOffset = CGPointMake(list.contentOffset.x, list.contentOffset.y - kDownloadRowHeight);
+  logDownload(@"sheet row added");
+}
+
+// The list is built after the sheet is presented, so it is looked for over the first moments.
+static void offerDownloadInSheet(UIViewController *sheet) {
+  NSDictionary *clip = clipOfStack(lastTouchedStack);
+  logDownload([NSString stringWithFormat:@"sheet clip=%d", clip != nil]);
+  if (!clip) return;
+  __weak UIViewController *weakSheet = sheet;
+  for (NSNumber *delay in @[ @0.2, @0.45, @0.8, @1.3 ]) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+      UIViewController *strongSheet = weakSheet;
+      if (!strongSheet.isViewLoaded) return;
+      UICollectionView *list = firstCollectionView(strongSheet.view, 0);
+      if (list && CGRectGetWidth(list.bounds) > 0 && firstRowLabel(list, 0)) addDownloadRow(list, clip);
+    });
+  }
+}
+
 static void installLongPress(UIView *stack) {
   if (objc_getAssociatedObject(stack, &kLongPressKey)) return;
   objc_setAssociatedObject(stack, &kLongPressKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1499,6 +1592,14 @@ static BOOL isZeroOnline(UILabel *label, NSString *text) {
 }
 %end
 
+%hook UIViewController
+- (void)presentViewController:(UIViewController *)controller animated:(BOOL)animated completion:(id)completion {
+  logPresented(controller);
+  %orig;
+  if ([NSStringFromClass(controller.class) containsString:@"ShareOverflowBottomSheet"]) offerDownloadInSheet(controller);
+}
+%end
+
 %hook UIImageView
 - (void)setImage:(UIImage *)image {
   %orig;
@@ -1535,6 +1636,8 @@ static BOOL isZeroOnline(UILabel *label, NSString *text) {
 %hook FeedStackSliceView
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
   UIView *stack = (UIView *)self;
+  // Remembers the post being touched, because the "more actions" sheet doesn't say which one it's for.
+  if ([stack pointInside:point withEvent:event]) lastTouchedStack = stack;
   UIView *cover = visibleCoverAtPoint(stack, stack, point, 0);
   return cover ?: %orig;
 }
@@ -1606,10 +1709,6 @@ static BOOL isZeroOnline(UILabel *label, NSString *text) {
 %end
 
 %hook UIViewController
-- (void)presentViewController:(UIViewController *)controller animated:(BOOL)animated completion:(id)completion {
-  logPresented(controller);
-  %orig;
-}
 - (void)viewDidAppear:(BOOL)animated {
   %orig;
   logScreen(self);
