@@ -338,6 +338,8 @@ static void logCoverState(UIView *media, BOOL covered, NSUInteger addresses) {
 
 static void logTap(void) { writeLog(@"TAP cover"); }
 
+static void logClipBlurHidden(void) { writeLog(@"CLIPBLUR hidden"); }
+
 static void logRevealApplied(NSUInteger page, NSUInteger views, NSUInteger updated) {
   writeLog([NSString stringWithFormat:@"REVEALSET page=%lu views=%lu updated=%lu", (unsigned long)page,
                                       (unsigned long)views, (unsigned long)updated]);
@@ -530,6 +532,7 @@ static inline void logFeedStackFound(BOOL found) {}
 static inline void logCoverState(UIView *media, BOOL covered, NSUInteger addresses) {}
 static inline void logReveal(NSUInteger index, BOOL decoded) {}
 static inline void logTap(void) {}
+static inline void logClipBlurHidden(void) {}
 static inline void logRevealApplied(NSUInteger page, NSUInteger views, NSUInteger updated) {}
 static inline void testActiveCountSources(NSURLRequest *source, NSString *operation) {}
 static inline void probeOnlineCount(NSURLRequest *source) {}
@@ -677,6 +680,17 @@ static BOOL processJSON(id object, NSString *path, NSString *operation, int dept
       dict[@"isObfuscated"] = @YES;
       changed = YES;
     }
+    // Clips are covered on screen instead. Left marked, the app keeps its own blur over the video,
+    // which stays after the cover is removed.
+    if ([dict[@"__typename"] isEqual:@"LegacyVideoCell"]) {
+      for (NSString *key in @[ @"media", @"preview" ]) {
+        NSMutableDictionary *source = dict[key];
+        if ([source isKindOfClass:NSMutableDictionary.class] && [source[@"isObfuscated"] isEqual:@YES]) {
+          source[@"isObfuscated"] = @NO;
+          changed = YES;
+        }
+      }
+    }
   } else if ([object isKindOfClass:NSArray.class]) {
     for (id item in (NSArray *)object)
       if (processJSON(item, path, operation, depth + 1)) changed = YES;
@@ -756,6 +770,20 @@ static void setClipBlocked(UIView *view, BOOL blocked, int depth) {
     return;
   }
   for (UIView *child in view.subviews) setClipBlocked(child, blocked, depth + 1);
+}
+
+// The app can also draw its own blur across a clip. The cover already handles blurring, so that
+// one is hidden; small blurred buttons in the player controls are left alone.
+static void hideNativeClipBlur(UIView *view, UIView *media, int depth) {
+  if (depth > 10 || view.tag == kCoverTag) return;
+  if ([view isKindOfClass:UIVisualEffectView.class]) {
+    if (CGRectGetWidth(view.bounds) >= CGRectGetWidth(media.bounds) * 0.8) {
+      view.hidden = YES;
+      logClipBlurHidden();
+    }
+    return;
+  }
+  for (UIView *child in view.subviews) hideNativeClipBlur(child, media, depth + 1);
 }
 
 // Titles are not always drawn by a UILabel, so any view that exposes its text is considered.
@@ -939,7 +967,10 @@ static void updateMediaCover(UIView *media, BOOL isTagged, NSString *key) {
       logRevealApplied(index, imageViews.count, 1);
     }
   }
-  if (isClip) setClipBlocked(media, covered, 0);
+  if (isClip) {
+    hideNativeClipBlur(media, media, 0);
+    setClipBlocked(media, covered, 0);
+  }
   updateCover(media, covered, key, YES);
   logCoverState(media, covered, addresses.count);
 }
