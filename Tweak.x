@@ -33,8 +33,6 @@ static char kRowHeightKey;
 static __weak UIView *lastTouchedStack;
 static char kPostKey;
 static char kFeedMediaKey;
-// Newest platform version this app version can be expected to accept; see processJSON.
-static NSString *const kGamePlatformVersion = @"0.12.0";
 static NSString *const kGameClientVersion = @"2026.44.0";
 static NSString *const kGameClientBuildNumber = @"700000";
 static NSString *const kGameClientBuild = @"2026.44.0.700000";
@@ -282,6 +280,7 @@ static void logField(NSString *key, NSString *keyPath, id value, NSString *opera
     BOOL isGameVersion = [keyPath containsString:@"devvit"] && [key isEqualToString:@"version"];
     if ((matches(versionKey, key) || isGameVersion) && [value length] <= 40)
       writeLog([NSString stringWithFormat:@"VERSION %@ %@=%@", operation, keyPath, value]);
+    if ([key isEqualToString:@"initialRender"]) logInitialRender(value);
     if ([key isEqualToString:@"webViewBaseUrl"])
       writeLog([NSString stringWithFormat:@"GAMEWEB %@", [NSURL URLWithString:value].host]);
     if (matches(upgradeText, value))
@@ -352,6 +351,34 @@ static void logCoverState(UIView *media, BOOL covered, NSUInteger addresses) {
 }
 
 static void logTap(void) { writeLog(@"TAP cover"); }
+
+static BOOL dataHasUpgradeNotice(NSData *data) {
+  for (NSString *word in @[ @"latest version", @"Uh oh", @"upgrade your app" ]) {
+    if ([data rangeOfData:[word dataUsingEncoding:NSUTF8StringEncoding] options:0 range:NSMakeRange(0, data.length)].location != NSNotFound)
+      return YES;
+  }
+  return NO;
+}
+
+// Shows whether the game servers send the notice, or the app decides it by itself.
+static void logGameResponse(NSURLRequest *request, NSURLResponse *response, NSData *data) {
+  if (![request.URL.host containsString:@"devvit"]) return;
+  NSHTTPURLResponse *http = [response isKindOfClass:NSHTTPURLResponse.class] ? (NSHTTPURLResponse *)response : nil;
+  writeLog([NSString stringWithFormat:@"GAMERESP path=%@ status=%ld type=%@ encoding=%@ grpc=%@ bytes=%lu notice=%d",
+                                      request.URL.lastPathComponent, (long)http.statusCode,
+                                      [http valueForHTTPHeaderField:@"Content-Type"],
+                                      [http valueForHTTPHeaderField:@"Content-Encoding"],
+                                      [http valueForHTTPHeaderField:@"grpc-status"], (unsigned long)data.length,
+                                      dataHasUpgradeNotice(data)]);
+}
+
+static void logInitialRender(NSString *value) {
+  NSData *decoded = [[NSData alloc] initWithBase64EncodedString:value options:NSDataBase64DecodingIgnoreUnknownCharacters];
+  writeLog([NSString stringWithFormat:@"GAMERENDER chars=%lu decoded=%lu noticeRaw=%d noticeDecoded=%d", (unsigned long)value.length,
+                                      (unsigned long)decoded.length,
+                                      dataHasUpgradeNotice([value dataUsingEncoding:NSUTF8StringEncoding]),
+                                      decoded ? dataHasUpgradeNotice(decoded) : 0]);
+}
 
 static void logDownload(NSString *text) { writeLog([@"DOWNLOAD " stringByAppendingString:text]); }
 
@@ -591,6 +618,7 @@ static inline void logFeedStackFound(BOOL found) {}
 static inline void logCoverState(UIView *media, BOOL covered, NSUInteger addresses) {}
 static inline void logReveal(NSUInteger index, BOOL decoded) {}
 static inline void logTap(void) {}
+static inline void logGameResponse(NSURLRequest *request, NSURLResponse *response, NSData *data) {}
 static inline void logDownload(NSString *text) {}
 static inline void logPresented(UIViewController *controller) {}
 static inline void logContextMenu(id delegate) {}
@@ -728,13 +756,6 @@ static BOOL processJSON(id object, NSString *path, NSString *operation, int dept
       id value = dict[key];
       NSString *keyPath = [path stringByAppendingFormat:@".%@", key];
       logField(key, keyPath, value, operation);
-      // Games declare the platform version they were built with, and this app version may refuse
-      // anything newer than it knows. Reporting an older one lets it try to open them.
-      if ([key isEqualToString:@"publicApiVersion"] && [value isKindOfClass:NSString.class] &&
-          [dict isKindOfClass:NSMutableDictionary.class] && ![value isEqualToString:kGamePlatformVersion]) {
-        dict[key] = kGamePlatformVersion;
-        changed = YES;
-      }
       if ([key isEqualToString:@"isNsfwMediaBlocked"] && [value isKindOfClass:NSNumber.class])
         blurEnabled = [value boolValue];
       if ([key isEqualToString:@"isNsfw"] && [value isKindOfClass:NSNumber.class] &&
@@ -745,6 +766,14 @@ static BOOL processJSON(id object, NSString *path, NSString *operation, int dept
       } else if (processJSON(value, keyPath, operation, depth + 1)) {
         changed = YES;
       }
+    }
+    // Highlight cards show an NSFW mark from their thumbnail's own flag, which can be set for posts
+    // that aren't NSFW. The post's flag is the one that counts.
+    NSMutableDictionary *thumbnail = dict[@"thumbnailV2"];
+    if ([thumbnail isKindOfClass:NSMutableDictionary.class] && [dict[@"isNsfw"] isEqual:@NO] &&
+        [thumbnail[@"isObfuscatedDefault"] isEqual:@YES]) {
+      thumbnail[@"isObfuscatedDefault"] = @NO;
+      changed = YES;
     }
     // Clips are covered on screen instead. Left marked, the app keeps its own blur over the video,
     // which stays after the cover is removed.
@@ -1593,6 +1622,7 @@ static BOOL isZeroOnline(UILabel *label, NSString *text) {
   void (^wrapped)(NSData *, NSURLResponse *, NSError *) =
       ^(NSData *data, NSURLResponse *response, NSError *error) {
         logResult(request, operation, response, error);
+        logGameResponse(request, response, data);
         handler(error ? data : processResponse(request, operation, data), response, error);
       };
   return %orig(requestForGameServers(request), wrapped);
