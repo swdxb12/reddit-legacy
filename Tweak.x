@@ -336,6 +336,13 @@ static void logCoverState(UIView *media, BOOL covered, NSUInteger addresses) {
   writeLog([NSString stringWithFormat:@"COVER %@ covered=%d addresses=%lu", kind, covered, (unsigned long)addresses]);
 }
 
+static void logTap(void) { writeLog(@"TAP cover"); }
+
+static void logRevealApplied(NSUInteger page, NSUInteger views, NSUInteger updated) {
+  writeLog([NSString stringWithFormat:@"REVEALSET page=%lu views=%lu updated=%lu", (unsigned long)page,
+                                      (unsigned long)views, (unsigned long)updated]);
+}
+
 static void logReveal(NSUInteger index, BOOL decoded) {
   writeLog([NSString stringWithFormat:@"REVEAL page=%lu decoded=%d", (unsigned long)index, decoded]);
 }
