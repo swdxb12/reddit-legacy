@@ -182,6 +182,86 @@ static void probeOnlineCount(NSURLRequest *source) {
         }] resume];
 }
 
+static void collectActiveCounts(id object, NSMutableSet<NSString *> *found, int depth) {
+  if (depth > 12) return;
+  if ([object isKindOfClass:NSDictionary.class]) {
+    for (NSString *key in (NSDictionary *)object) {
+      id value = object[key];
+      NSString *lower = key.lowercaseString;
+      if (([lower containsString:@"active"] || [lower containsString:@"online"] || [lower containsString:@"presence"]) &&
+          [value isKindOfClass:NSNumber.class])
+        [found addObject:[NSString stringWithFormat:@"%@=%@", key, value]];
+      collectActiveCounts(value, found, depth + 1);
+    }
+  } else if ([object isKindOfClass:NSArray.class]) {
+    for (id item in (NSArray *)object) collectActiveCounts(item, found, depth + 1);
+  }
+}
+
+static void runActiveCountTest(NSString *label, NSURLRequest *request) {
+  [[NSURLSession.sharedSession
+      dataTaskWithRequest:request
+        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+          NSInteger status = [response isKindOfClass:NSHTTPURLResponse.class]
+                                 ? ((NSHTTPURLResponse *)response).statusCode
+                                 : 0;
+          id json = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+          NSMutableSet<NSString *> *found = [NSMutableSet set];
+          collectActiveCounts(json, found, 0);
+          NSString *errors = @"";
+          if ([json isKindOfClass:NSDictionary.class] && [json[@"errors"] isKindOfClass:NSArray.class]) {
+            id first = [json[@"errors"] firstObject];
+            if ([first isKindOfClass:NSDictionary.class] && [first[@"message"] isKindOfClass:NSString.class]) errors = first[@"message"];
+          }
+          writeLog([NSString stringWithFormat:@"ACTIVETEST %@ status=%ld bytes=%lu values=%@ error=%@", label, (long)status,
+                                              (unsigned long)data.length, [found.allObjects componentsJoinedByString:@","],
+                                              errors.length > 120 ? [errors substringToIndex:120] : errors]);
+        }] resume];
+}
+
+// Checks whether the server hides the online count from old app versions: repeats the app's own
+// request as a current version, and tries the query web clients use. The token only goes to
+// gql-fed.reddit.com, and only numbers named active, online or presence are logged.
+static void testActiveCountSources(NSURLRequest *source, NSString *operation) {
+  if (![operation isEqualToString:@"SubredditsForNames"]) return;
+  static atomic_flag started = ATOMIC_FLAG_INIT;
+  if (atomic_flag_test_and_set(&started)) return;
+  NSString *agent = [NSString stringWithFormat:@"Reddit/Version %@/Build %@/iOS Version 16.7.12 (Build 20H364)",
+                                               kGameClientVersion, kGameClientBuildNumber];
+  NSString *clientVersion = [NSString stringWithFormat:@"%@-%@", kGameClientVersion, kGameClientBuildNumber];
+
+  NSMutableURLRequest *current = [source mutableCopy];
+  [current setValue:agent forHTTPHeaderField:@"User-Agent"];
+  [current setValue:clientVersion forHTTPHeaderField:@"apollographql-client-version"];
+  runActiveCountTest(@"sameQueryCurrentVersion", current);
+
+  runActiveCountTest(@"sameQueryRealVersion", [source copy]);
+
+  NSMutableURLRequest *web = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://gql-fed.reddit.com/?SubredditInfoByName"]];
+  web.HTTPMethod = @"POST";
+  [web setValue:[source valueForHTTPHeaderField:@"Authorization"] forHTTPHeaderField:@"Authorization"];
+  [web setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+  [web setValue:agent forHTTPHeaderField:@"User-Agent"];
+  NSDictionary *body = @{
+    @"operationName" : @"SubredditInfoByName",
+    @"variables" : @{
+      @"subredditName" : @"AskReddit",
+      @"filterGated" : @NO,
+      @"includeRecapFields" : @NO,
+      @"includeWelcomePage" : @NO,
+      @"includeDevvitData" : @NO
+    },
+    @"extensions" : @{
+      @"persistedQuery" : @{
+        @"version" : @1,
+        @"sha256Hash" : @"6b9c1679e69097e1c6df364adc11183afe6e2b6545dd1c0c1cc8f7490448c3e5"
+      }
+    }
+  };
+  web.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+  runActiveCountTest(@"webQueryCurrentVersion", web);
+}
+
 static NSString *describeValue(id value) {
   if ([value isKindOfClass:NSNumber.class]) return [value description];
   if ([value isKindOfClass:NSString.class])
@@ -457,6 +537,7 @@ static inline void logFeedStackFound(BOOL found) {}
 static inline void logBadgeState(UIView *media, UILabel *badge, NSUInteger addresses, CGFloat detail) {}
 static inline void logReveal(NSUInteger index, BOOL decoded) {}
 static inline void logTap(void) {}
+static inline void testActiveCountSources(NSURLRequest *source, NSString *operation) {}
 static inline void logDetail(UIView *media, CGFloat detail, BOOL isTagged) {}
 static inline void probeOnlineCount(NSURLRequest *source) {}
 static inline void logField(NSString *key, NSString *keyPath, id value, NSString *operation) {}
@@ -911,6 +992,7 @@ static BOOL isZeroOnline(NSString *text) {
   if (!handler || !shouldWrap(request.URL.host)) return %orig;
   probeOnlineCount(request);
   NSString *operation = operationName(request);
+  testActiveCountSources(request, operation);
   void (^wrapped)(NSData *, NSURLResponse *, NSError *) =
       ^(NSData *data, NSURLResponse *response, NSError *error) {
         logResult(request, operation, response, error);
