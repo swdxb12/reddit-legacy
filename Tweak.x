@@ -334,7 +334,14 @@ static void logCoverState(UIView *media, BOOL covered, NSUInteger addresses) {
   NSString *kind = [name containsString:@"Carousel"] ? @"carousel"
                    : [name containsString:@"Video"]  ? @"video"
                                                      : @"image";
-  writeLog([NSString stringWithFormat:@"COVER %@ covered=%d addresses=%lu", kind, covered, (unsigned long)addresses]);
+  NSMutableArray<NSString *> *sizes = [NSMutableArray array];
+  for (UIView *child in media.subviews) {
+    for (UIView *inner in child.subviews)
+      [sizes addObject:[NSString stringWithFormat:@"%.0fx%.0f@%.0f", inner.bounds.size.width, inner.bounds.size.height, inner.frame.origin.x]];
+  }
+  writeLog([NSString stringWithFormat:@"COVER %@ covered=%d addresses=%lu media=%.0f inner=%@", kind, covered,
+                                      (unsigned long)addresses, media.bounds.size.width,
+                                      [sizes componentsJoinedByString:@","]]);
 }
 
 static void logTap(void) { writeLog(@"TAP cover"); }
@@ -979,6 +986,8 @@ static UIView *makeCover(UIView *host, BOOL withBadge) {
   return cover;
 }
 
+static CGFloat cornerRadiusOfContent(UIView *view, int depth);
+
 static void updateCover(UIView *host, BOOL covered, NSString *key, BOOL withBadge) {
   UIView *cover = nil;
   for (UIView *child in host.subviews) {
@@ -990,7 +999,35 @@ static void updateCover(UIView *host, BOOL covered, NSString *key, BOOL withBadg
   }
   if (!cover) cover = makeCover(host, withBadge);
   cover.hidden = NO;
+  CGFloat radius = cornerRadiusOfContent(host, 0);
+  if (radius > 0) cover.layer.cornerRadius = radius;
   objc_setAssociatedObject(cover, &kPostKey, key, OBJC_ASSOCIATION_COPY_NONATOMIC);
+}
+
+// The media container spans the whole feed width, with the image inset inside it. The cover goes
+// on the inner view so it matches the image.
+static UIView *mediaContentView(UIView *view, int depth) {
+  if (depth > 6) return nil;
+  NSString *name = NSStringFromClass(view.class);
+  if (depth > 0 && ([name hasSuffix:@"ServerImageSliceView"] || [name hasSuffix:@"CarouselSliceView"] ||
+                    [name hasSuffix:@"LegacyVideoSliceView"]))
+    return view;
+  for (UIView *child in view.subviews) {
+    UIView *found = mediaContentView(child, depth + 1);
+    if (found) return found;
+  }
+  return nil;
+}
+
+// Corners are rounded on the host or on a view just inside it.
+static CGFloat cornerRadiusOfContent(UIView *view, int depth) {
+  CGFloat radius = view.layer.cornerRadius;
+  if (radius > 0 || depth > 4) return radius;
+  for (UIView *child in view.subviews) {
+    if (child.tag == kCoverTag) continue;
+    radius = MAX(radius, cornerRadiusOfContent(child, depth + 1));
+  }
+  return radius;
 }
 
 static void updateMediaCover(UIView *media, BOOL isTagged, NSString *key) {
@@ -1014,7 +1051,10 @@ static void updateMediaCover(UIView *media, BOOL isTagged, NSString *key) {
     hideNativeClipBlur(media, media, 0);
     setClipBlocked(media, covered, 0);
   }
-  updateCover(media, covered, key, YES);
+  UIView *content = mediaContentView(media, 0) ?: media;
+  // The inner view can appear after a first pass that had to use the container.
+  if (content != media) updateCover(media, NO, key, YES);
+  updateCover(content, covered, key, YES);
   logCoverState(media, covered, addresses.count);
 }
 
