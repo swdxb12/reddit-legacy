@@ -4,7 +4,7 @@
 //  - Blurs media inside NSFW subreddits, as the home feed already does.
 //  - Removes ads from GraphQL responses.
 //  - Reports a current version to Reddit's game servers.
-//  - Adds a "View 18+ content" badge over blurred feed media, which clears images in place.
+//  - Blurs all 18+ feed media with a "View 18+ content" cover; a tap reveals that post in place.
 //
 // Development builds (without RELEASE=1) also write and upload a diagnostics log: field names,
 // numbers, booleans, API error messages, screen classes and short on-screen labels matching
@@ -17,16 +17,14 @@
 
 static const NSUInteger kMaxJSONBytes = 20 * 1024 * 1024;
 static const int kMaxDepth = 64;
-static const NSInteger kBadgeTag = 0x52454444;
+static const NSInteger kCoverTag = 0x52454444;
 static BOOL blurEnabled = YES;
 static const CGFloat kMinMediaWidth = 100;
-static const CGFloat kBlurredDetailLimit = 5;
-enum { kDetailSide = 64 };
+static const CGFloat kMinThumbnailWidth = 40;
 static NSMutableDictionary<NSString *, NSArray<NSString *> *> *clearAddressesByTitle;
 static NSCache<NSString *, UIImage *> *revealedImages;
-static char kImageDetailKey;
-static char kClearAddressesKey;
-static char kRecheckPendingKey;
+static NSMutableSet<NSString *> *revealedPosts;
+static char kPostKey;
 static char kFeedMediaKey;
 // Newest platform version this app version can be expected to accept; see processJSON.
 static NSString *const kGamePlatformVersion = @"0.12.0";
@@ -330,34 +328,16 @@ static void logWebViewNotice(WKWebView *webView) {
   });
 }
 
-// Runs one turn later, once Auto Layout has placed the badge.
-static void logBadgeState(UIView *media, UILabel *badge, NSUInteger addresses, CGFloat detail) {
-  dispatch_async(dispatch_get_main_queue(), ^{
-    NSString *name = NSStringFromClass(media.class);
-    NSString *kind = [name containsString:@"Carousel"] ? @"carousel"
-                     : [name containsString:@"Video"]  ? @"video"
-                                                       : @"image";
-    writeLog([NSString stringWithFormat:@"BADGEPOS %@ media=%.0fx%.0f addresses=%lu detail=%.0f shown=%d", kind,
-                                        media.bounds.size.width, media.bounds.size.height,
-                                        (unsigned long)addresses, MIN(detail, 999), !badge.hidden]);
-  });
-}
-
-static void logTap(void) { writeLog(@"TAP badge"); }
-
-static void logRevealApplied(NSUInteger page, NSUInteger views, NSUInteger updated) {
-  writeLog([NSString stringWithFormat:@"REVEALSET page=%lu views=%lu updated=%lu", (unsigned long)page,
-                                      (unsigned long)views, (unsigned long)updated]);
+static void logCoverState(UIView *media, BOOL covered, NSUInteger addresses) {
+  NSString *name = NSStringFromClass(media.class);
+  NSString *kind = [name containsString:@"Carousel"] ? @"carousel"
+                   : [name containsString:@"Video"]  ? @"video"
+                                                     : @"image";
+  writeLog([NSString stringWithFormat:@"COVER %@ covered=%d addresses=%lu", kind, covered, (unsigned long)addresses]);
 }
 
 static void logReveal(NSUInteger index, BOOL decoded) {
   writeLog([NSString stringWithFormat:@"REVEAL page=%lu decoded=%d", (unsigned long)index, decoded]);
-}
-
-// Records how blurred and clear images measure, to check the limit against real images.
-static void logDetail(UIView *media, CGFloat detail, BOOL isTagged) {
-  NSString *kind = [NSStringFromClass(media.class) containsString:@"Video"] ? @"video" : @"image";
-  writeLog([NSString stringWithFormat:@"DETAIL %@ tagged=%d value=%.0f", kind, isTagged, MIN(detail, 999)]);
 }
 
 static void logFeedStackFound(BOOL found) {
@@ -540,12 +520,11 @@ static inline void logRequestVersion(NSURLRequest *request, NSURLSession *sessio
 static inline void logWebView(NSURL *url) {}
 static inline void logWebViewNotice(WKWebView *webView) {}
 static inline void logFeedStackFound(BOOL found) {}
-static inline void logBadgeState(UIView *media, UILabel *badge, NSUInteger addresses, CGFloat detail) {}
+static inline void logCoverState(UIView *media, BOOL covered, NSUInteger addresses) {}
 static inline void logReveal(NSUInteger index, BOOL decoded) {}
 static inline void logTap(void) {}
 static inline void logRevealApplied(NSUInteger page, NSUInteger views, NSUInteger updated) {}
 static inline void testActiveCountSources(NSURLRequest *source, NSString *operation) {}
-static inline void logDetail(UIView *media, CGFloat detail, BOOL isTagged) {}
 static inline void probeOnlineCount(NSURLRequest *source) {}
 static inline void logField(NSString *key, NSString *keyPath, id value, NSString *operation) {}
 static inline void logStructure(NSDictionary *dict, NSString *path, NSString *operation) {}
@@ -639,18 +618,8 @@ static void rememberPostImages(NSDictionary *group) {
         if ([page isKindOfClass:NSDictionary.class]) addClearAddress(page[@"image"], addresses);
     }
   }
-  if (title.length == 0 || addresses.count == 0) return;
+  if (title.length == 0) return;
   @synchronized(clearAddressesByTitle) { clearAddressesByTitle[normalizedTitle(title)] = addresses; }
-}
-
-static BOOL cellHasBlurredCopy(NSDictionary *cell) {
-  for (NSString *key in @[ @"media", @"preview" ]) {
-    NSDictionary *source = cell[key];
-    if ([source isKindOfClass:NSDictionary.class] && [source[@"obfuscatedPath"] isKindOfClass:NSString.class] &&
-        [source[@"obfuscatedPath"] length] > 0)
-      return YES;
-  }
-  return NO;
 }
 
 static BOOL isSubredditObject(NSDictionary *dict, NSString *path) {
@@ -701,16 +670,6 @@ static BOOL processJSON(id object, NSString *path, NSString *operation, int dept
       dict[@"isObfuscated"] = @YES;
       changed = YES;
     }
-    // A blurred clip playing by itself is pointless, so it waits for a tap like an image does.
-    if ([dict[@"__typename"] isEqual:@"LegacyVideoCell"] && [dict isKindOfClass:NSMutableDictionary.class] &&
-        cellHasBlurredCopy(dict)) {
-      for (NSString *key in @[ @"isAutoplayAllowed", @"isGif" ]) {
-        if ([dict[key] isEqual:@YES]) {
-          dict[key] = @NO;
-          changed = YES;
-        }
-      }
-    }
   } else if ([object isKindOfClass:NSArray.class]) {
     for (id item in (NSArray *)object)
       if (processJSON(item, path, operation, depth + 1)) changed = YES;
@@ -738,39 +697,11 @@ static BOOL isBlurredMediaContainer(UIView *view) {
           [name containsString:@"LegacyVideo"]);
 }
 
-static void collectImageViews(UIView *view, NSMutableArray<UIImageView *> *found, int depth) {
+static void collectImageViews(UIView *view, CGFloat minWidth, NSMutableArray<UIImageView *> *found, int depth) {
   if (depth > 14) return;
-  if ([view isKindOfClass:UIImageView.class] && CGRectGetWidth(view.bounds) >= kMinMediaWidth)
+  if ([view isKindOfClass:UIImageView.class] && CGRectGetWidth(view.bounds) >= minWidth)
     [found addObject:(UIImageView *)view];
-  for (UIView *child in view.subviews) collectImageViews(child, found, depth + 1);
-}
-
-// Mean difference between neighbouring pixels of a small grayscale copy. A blurred copy has almost
-// no fine detail, so this tells it apart from the clear image wherever the image came from.
-static CGFloat imageDetail(UIImage *image) {
-  NSNumber *cached = objc_getAssociatedObject(image, &kImageDetailKey);
-  if (cached) return cached.doubleValue;
-  CGImageRef source = image.CGImage;
-  if (!source) return CGFLOAT_MAX;
-  uint8_t pixels[kDetailSide * kDetailSide];
-  CGColorSpaceRef gray = CGColorSpaceCreateDeviceGray();
-  CGContextRef context = CGBitmapContextCreate(pixels, kDetailSide, kDetailSide, 8, kDetailSide, gray,
-                                               (CGBitmapInfo)kCGImageAlphaNone);
-  CGColorSpaceRelease(gray);
-  if (!context) return CGFLOAT_MAX;
-  CGContextSetInterpolationQuality(context, kCGInterpolationLow);
-  CGContextDrawImage(context, CGRectMake(0, 0, kDetailSide, kDetailSide), source);
-  CGContextRelease(context);
-  uint64_t total = 0;
-  for (int y = 0; y < kDetailSide - 1; y++) {
-    for (int x = 0; x < kDetailSide - 1; x++) {
-      int value = pixels[y * kDetailSide + x];
-      total += abs(value - pixels[y * kDetailSide + x + 1]) + abs(value - pixels[(y + 1) * kDetailSide + x]);
-    }
-  }
-  CGFloat detail = (CGFloat)total / (2.0 * (kDetailSide - 1) * (kDetailSide - 1));
-  objc_setAssociatedObject(image, &kImageDetailKey, @(detail), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-  return detail;
+  for (UIView *child in view.subviews) collectImageViews(child, minWidth, found, depth + 1);
 }
 
 // Gallery pages sit side by side, so a page's position gives its index in the post.
@@ -784,53 +715,6 @@ static NSUInteger pageIndexOfImageView(UIView *imageView) {
   return 0;
 }
 
-static void revealImagesIn(UIView *media, UILabel *badge) {
-  NSArray<NSString *> *addresses = objc_getAssociatedObject(badge, &kClearAddressesKey);
-  if (addresses.count == 0) return;
-  badge.hidden = YES;
-  __weak UIView *weakMedia = media;
-  for (NSUInteger index = 0; index < addresses.count; index++) {
-    NSString *address = addresses[index];
-    NSURL *url = [NSURL URLWithString:address];
-    if (!url) continue;
-    [[NSURLSession.sharedSession
-          dataTaskWithURL:url
-        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-          UIImage *image = data ? [UIImage imageWithData:data] : nil;
-          logReveal(index, image != nil);
-          dispatch_async(dispatch_get_main_queue(), ^{
-            if (!image) {
-              badge.hidden = NO;
-              return;
-            }
-            [revealedImages setObject:image forKey:address];
-            NSMutableArray<UIImageView *> *imageViews = [NSMutableArray array];
-            collectImageViews(weakMedia, imageViews, 0);
-            NSUInteger updated = 0;
-            for (UIImageView *imageView in imageViews) {
-              if (pageIndexOfImageView(imageView) == index) {
-                imageView.image = image;
-                updated++;
-              }
-            }
-            logRevealApplied(index, imageViews.count, updated);
-          });
-        }] resume];
-  }
-}
-
-@interface RedditLegacyBadgeTarget : NSObject
-- (void)badgeTapped:(UITapGestureRecognizer *)recognizer;
-@end
-
-@implementation RedditLegacyBadgeTarget
-- (void)badgeTapped:(UITapGestureRecognizer *)recognizer {
-  UILabel *badge = (UILabel *)recognizer.view;
-  logTap();
-  if (badge.superview) revealImagesIn(badge.superview, badge);
-}
-@end
-
 static BOOL hasAdultTag(UIView *view, int depth) {
   if (depth > 12 || isBlurredMediaContainer(view)) return NO;
   if ([view isKindOfClass:UILabel.class] && [((UILabel *)view).text containsString:@"18+"] &&
@@ -839,26 +723,6 @@ static BOOL hasAdultTag(UIView *view, int depth) {
   for (UIView *child in view.subviews)
     if (hasAdultTag(child, depth + 1)) return YES;
   return NO;
-}
-
-static void refreshAdultBadges(UIView *stack);
-
-// An image can change without a new layout pass, for example after the app clears it, so a badge
-// on screen keeps checking what is under it.
-static void scheduleBadgeRecheck(UILabel *badge) {
-  if (objc_getAssociatedObject(badge, &kRecheckPendingKey)) return;
-  objc_setAssociatedObject(badge, &kRecheckPendingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-  __weak UILabel *weakBadge = badge;
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-    UILabel *strongBadge = weakBadge;
-    if (!strongBadge) return;
-    objc_setAssociatedObject(strongBadge, &kRecheckPendingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    if (!strongBadge.window || strongBadge.hidden) return;
-    Class feedStack = NSClassFromString(@"FeedKit_Slices.FeedStackSliceView");
-    UIView *view = strongBadge;
-    while (view && ![view isKindOfClass:feedStack]) view = view.superview;
-    if (view) refreshAdultBadges(view);
-  });
 }
 
 static AVPlayerLayer *playerLayerIn(CALayer *layer, int depth) {
@@ -872,96 +736,19 @@ static AVPlayerLayer *playerLayerIn(CALayer *layer, int depth) {
   return nil;
 }
 
-// Only the poster of a clip is blurred: the player draws the clear video over it. So the player
-// view stays hidden and paused behind the badge, leaving the blurred poster visible.
+// A clip's player draws over everything below it, so it stays hidden and paused while covered,
+// and starts once its post is revealed.
 static void setClipBlocked(UIView *view, BOOL blocked, int depth) {
   if (depth > 10) return;
   if ([NSStringFromClass(view.class) containsString:@"PlayerLayerView"]) {
+    BOOL wasBlocked = view.hidden;
     view.hidden = blocked;
-    if (blocked) {
-      AVPlayer *player = playerLayerIn(view.layer, 0).player;
-      if (player.rate != 0) [player pause];
-    }
+    AVPlayer *player = playerLayerIn(view.layer, 0).player;
+    if (blocked && player.rate != 0) [player pause];
+    if (!blocked && wasBlocked) [player play];
     return;
   }
   for (UIView *child in view.subviews) setClipBlocked(child, blocked, depth + 1);
-}
-
-// The badge shows only over a post's image that really looks blurred, so one the app already
-// cleared loses it. With known clear addresses a tap clears the image in place; otherwise touches
-// pass through to the app's own handler.
-static void updateAdultBadge(UIView *media, BOOL isTagged, NSArray<NSString *> *addresses) {
-  static RedditLegacyBadgeTarget *target;
-  if (!target) target = [RedditLegacyBadgeTarget new];
-  // Clips open in the app's own player; only images can be cleared in place.
-  BOOL isClip = [NSStringFromClass(media.class) containsString:@"LegacyVideo"];
-  if (isClip) addresses = nil;
-  NSMutableArray<UIImageView *> *imageViews = [NSMutableArray array];
-  collectImageViews(media, imageViews, 0);
-  BOOL isBlurred = NO;
-  CGFloat lowestDetail = CGFLOAT_MAX;
-  for (UIImageView *imageView in imageViews) {
-    objc_setAssociatedObject(imageView, &kFeedMediaKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    NSUInteger index = pageIndexOfImageView(imageView);
-    UIImage *revealed = index < addresses.count ? [revealedImages objectForKey:addresses[index]] : nil;
-    if (revealed) {
-      if (imageView.image != revealed) imageView.image = revealed;
-      continue;
-    }
-    if (!imageView.image) continue;
-    CGFloat detail = imageDetail(imageView.image);
-    lowestDetail = MIN(lowestDetail, detail);
-    if (detail < kBlurredDetailLimit) isBlurred = YES;
-  }
-  if (lowestDetail < CGFLOAT_MAX) logDetail(media, lowestDetail, isTagged);
-  BOOL show = isTagged && isBlurred;
-  UILabel *badge = (UILabel *)[media viewWithTag:kBadgeTag];
-  if (isClip) setClipBlocked(media, show, 0);
-  if (!show) {
-    badge.hidden = YES;
-    return;
-  }
-  if (!badge) {
-    badge = [UILabel new];
-    badge.tag = kBadgeTag;
-    BOOL isSpanish = [NSLocale.preferredLanguages.firstObject hasPrefix:@"es"];
-    badge.text = isSpanish ? @"Ver contenido 18+" : @"View 18+ content";
-    badge.font = [UIFont boldSystemFontOfSize:13];
-    badge.textColor = UIColor.whiteColor;
-    badge.textAlignment = NSTextAlignmentCenter;
-    badge.backgroundColor = [UIColor colorWithWhite:0 alpha:0.75];
-    badge.clipsToBounds = YES;
-    [badge addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:target
-                                                                        action:@selector(badgeTapped:)]];
-    CGSize size = [badge sizeThatFits:CGSizeZero];
-    CGFloat height = size.height + 14;
-    badge.layer.cornerRadius = height / 2;
-    // Images finish loading after this runs, so the badge must stay above views added later.
-    badge.layer.zPosition = 1000;
-    badge.translatesAutoresizingMaskIntoConstraints = NO;
-    [media addSubview:badge];
-    // The container has no final size yet at this point, so its center is left to Auto Layout.
-    [NSLayoutConstraint activateConstraints:@[
-      [badge.widthAnchor constraintEqualToConstant:size.width + 24],
-      [badge.heightAnchor constraintEqualToConstant:height],
-      [badge.centerXAnchor constraintEqualToAnchor:media.centerXAnchor],
-      [badge.centerYAnchor constraintEqualToAnchor:media.centerYAnchor],
-    ]];
-  }
-  badge.hidden = NO;
-  objc_setAssociatedObject(badge, &kClearAddressesKey, addresses, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-  badge.userInteractionEnabled = addresses.count > 0;
-  scheduleBadgeRecheck(badge);
-  logBadgeState(media, badge, addresses.count, lowestDetail);
-}
-
-static void updateAdultBadges(UIView *view, BOOL isTagged, NSArray<NSString *> *addresses, int depth) {
-  if (depth > 6) return;
-  if (isBlurredMediaContainer(view)) {
-    updateAdultBadge(view, isTagged, addresses);
-    return;
-  }
-  for (UIView *child in view.subviews) updateAdultBadges(child, isTagged, addresses, depth + 1);
 }
 
 // Titles are not always drawn by a UILabel, so any view that exposes its text is considered.
@@ -973,43 +760,219 @@ static NSString *textOfView(UIView *view) {
   return nil;
 }
 
-// Finds the clear image addresses by matching the post's title on screen to the feed data.
-static NSArray<NSString *> *clearAddressesInStack(UIView *view, int depth) {
+// A post is identified by its title from the feed data. If it isn't found, the longest text in
+// the post stands in, so a revealed post still stays revealed while scrolling.
+static NSString *findPostKey(UIView *view, NSString **longest, int depth) {
   if (depth > 12 || isBlurredMediaContainer(view)) return nil;
   NSString *text = textOfView(view);
   if (text.length) {
     NSString *title = normalizedTitle(text);
     @synchronized(clearAddressesByTitle) {
-      NSArray<NSString *> *found = clearAddressesByTitle[title];
-      if (found) return found;
+      if (clearAddressesByTitle[title]) return title;
     }
+    if (title.length > (*longest).length) *longest = title;
   }
   for (UIView *child in view.subviews) {
-    NSArray<NSString *> *found = clearAddressesInStack(child, depth + 1);
+    NSString *found = findPostKey(child, longest, depth + 1);
     if (found) return found;
   }
   return nil;
 }
 
-// The feed captures touches before they reach the badge, so it is handed them directly.
-static UILabel *tappableBadgeAtPoint(UIView *view, UIView *stack, CGPoint point, int depth) {
-  if (depth > 6) return nil;
+static NSArray<NSString *> *clearAddressesForPost(NSString *key) {
+  if (!key) return nil;
+  @synchronized(clearAddressesByTitle) {
+    return clearAddressesByTitle[key];
+  }
+}
+
+static BOOL isPostRevealed(NSString *key) {
+  if (!key) return NO;
+  @synchronized(revealedPosts) {
+    return [revealedPosts containsObject:key];
+  }
+}
+
+static void refreshAdultBadges(UIView *stack);
+
+static void refreshFeedStackOf(UIView *view) {
+  Class feedStack = NSClassFromString(@"FeedKit_Slices.FeedStackSliceView");
+  while (view && ![view isKindOfClass:feedStack]) view = view.superview;
+  if (view) refreshAdultBadges(view);
+}
+
+// When the server sent a blurred copy, the image view is showing it, so the clear image has to be
+// fetched. Otherwise removing the cover is enough, and the fetch is skipped.
+static void fetchClearImages(UIView *host, NSString *key) {
+  NSArray<NSString *> *addresses = clearAddressesForPost(key);
+  __weak UIView *weakHost = host;
+  for (NSUInteger index = 0; index < addresses.count; index++) {
+    NSString *address = addresses[index];
+    NSURL *url = [NSURL URLWithString:address];
+    if (!url || [revealedImages objectForKey:address]) continue;
+    [[NSURLSession.sharedSession
+          dataTaskWithURL:url
+        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+          UIImage *image = data ? [UIImage imageWithData:data] : nil;
+          logReveal(index, image != nil);
+          if (!image) return;
+          dispatch_async(dispatch_get_main_queue(), ^{
+            [revealedImages setObject:image forKey:address];
+            UIView *strongHost = weakHost;
+            if (strongHost) refreshFeedStackOf(strongHost);
+          });
+        }] resume];
+  }
+}
+
+@interface RedditLegacyCoverTarget : NSObject
+- (void)coverTapped:(UITapGestureRecognizer *)recognizer;
+@end
+
+@implementation RedditLegacyCoverTarget
+- (void)coverTapped:(UITapGestureRecognizer *)recognizer {
+  UIView *cover = recognizer.view;
+  NSString *key = objc_getAssociatedObject(cover, &kPostKey);
+  logTap();
+  if (key) {
+    @synchronized(revealedPosts) {
+      [revealedPosts addObject:key];
+    }
+  }
+  cover.hidden = YES;
+  UIView *host = cover.superview;
+  fetchClearImages(host, key);
+  refreshFeedStackOf(host);
+}
+@end
+
+// The blur is drawn here, so it covers all 18+ media whether or not the server sent a blurred copy.
+static UIView *makeCover(UIView *host, BOOL withBadge) {
+  static RedditLegacyCoverTarget *target;
+  if (!target) target = [RedditLegacyCoverTarget new];
+  UIView *cover = [UIView new];
+  cover.tag = kCoverTag;
+  cover.clipsToBounds = YES;
+  cover.layer.cornerRadius = withBadge ? 12 : 6;
+  // Images finish loading after this runs, so the cover must stay above views added later.
+  cover.layer.zPosition = 1000;
+  cover.translatesAutoresizingMaskIntoConstraints = NO;
+  [cover addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:target
+                                                                      action:@selector(coverTapped:)]];
+  UIBlurEffect *effect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThickMaterialDark];
+  UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:effect];
+  blur.translatesAutoresizingMaskIntoConstraints = NO;
+  blur.userInteractionEnabled = NO;
+  [cover addSubview:blur];
+  [host addSubview:cover];
+  // The host has no final size yet at this point, so the layout is left to Auto Layout.
+  [NSLayoutConstraint activateConstraints:@[
+    [cover.topAnchor constraintEqualToAnchor:host.topAnchor],
+    [cover.bottomAnchor constraintEqualToAnchor:host.bottomAnchor],
+    [cover.leadingAnchor constraintEqualToAnchor:host.leadingAnchor],
+    [cover.trailingAnchor constraintEqualToAnchor:host.trailingAnchor],
+    [blur.topAnchor constraintEqualToAnchor:cover.topAnchor],
+    [blur.bottomAnchor constraintEqualToAnchor:cover.bottomAnchor],
+    [blur.leadingAnchor constraintEqualToAnchor:cover.leadingAnchor],
+    [blur.trailingAnchor constraintEqualToAnchor:cover.trailingAnchor],
+  ]];
+  if (withBadge) {
+    UILabel *badge = [UILabel new];
+    BOOL isSpanish = [NSLocale.preferredLanguages.firstObject hasPrefix:@"es"];
+    badge.text = isSpanish ? @"Ver contenido 18+" : @"View 18+ content";
+    badge.font = [UIFont boldSystemFontOfSize:13];
+    badge.textColor = UIColor.whiteColor;
+    badge.textAlignment = NSTextAlignmentCenter;
+    badge.backgroundColor = [UIColor colorWithWhite:0 alpha:0.75];
+    badge.clipsToBounds = YES;
+    badge.userInteractionEnabled = NO;
+    CGSize size = [badge sizeThatFits:CGSizeZero];
+    CGFloat height = size.height + 14;
+    badge.layer.cornerRadius = height / 2;
+    badge.translatesAutoresizingMaskIntoConstraints = NO;
+    [cover addSubview:badge];
+    [NSLayoutConstraint activateConstraints:@[
+      [badge.widthAnchor constraintEqualToConstant:size.width + 24],
+      [badge.heightAnchor constraintEqualToConstant:height],
+      [badge.centerXAnchor constraintEqualToAnchor:cover.centerXAnchor],
+      [badge.centerYAnchor constraintEqualToAnchor:cover.centerYAnchor],
+    ]];
+  }
+  return cover;
+}
+
+static void updateCover(UIView *host, BOOL covered, NSString *key, BOOL withBadge) {
+  UIView *cover = nil;
+  for (UIView *child in host.subviews) {
+    if (child.tag == kCoverTag) cover = child;
+  }
+  if (!covered) {
+    cover.hidden = YES;
+    return;
+  }
+  if (!cover) cover = makeCover(host, withBadge);
+  cover.hidden = NO;
+  objc_setAssociatedObject(cover, &kPostKey, key, OBJC_ASSOCIATION_COPY_NONATOMIC);
+}
+
+static void updateMediaCover(UIView *media, BOOL isTagged, NSString *key) {
+  BOOL isClip = [NSStringFromClass(media.class) containsString:@"LegacyVideo"];
+  BOOL isRevealed = isPostRevealed(key);
+  BOOL covered = isTagged && !isRevealed;
+  NSArray<NSString *> *addresses = isClip ? nil : clearAddressesForPost(key);
+  NSMutableArray<UIImageView *> *imageViews = [NSMutableArray array];
+  collectImageViews(media, kMinMediaWidth, imageViews, 0);
+  for (UIImageView *imageView in imageViews) {
+    objc_setAssociatedObject(imageView, &kFeedMediaKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!isRevealed) continue;
+    NSUInteger index = pageIndexOfImageView(imageView);
+    UIImage *clear = index < addresses.count ? [revealedImages objectForKey:addresses[index]] : nil;
+    if (clear && imageView.image != clear) {
+      imageView.image = clear;
+      logRevealApplied(index, imageViews.count, 1);
+    }
+  }
+  if (isClip) setClipBlocked(media, covered, 0);
+  updateCover(media, covered, key, YES);
+  logCoverState(media, covered, addresses.count);
+}
+
+static void updateThumbnailCovers(UIView *view, BOOL covered, NSString *key) {
+  NSMutableArray<UIImageView *> *imageViews = [NSMutableArray array];
+  collectImageViews(view, kMinThumbnailWidth, imageViews, 0);
+  for (UIImageView *imageView in imageViews) updateCover(imageView, covered, key, NO);
+}
+
+static void updatePostMedia(UIView *view, BOOL isTagged, NSString *key, int depth) {
+  if (depth > 6) return;
   if (isBlurredMediaContainer(view)) {
-    UILabel *badge = (UILabel *)[view viewWithTag:kBadgeTag];
-    if (badge && !badge.hidden && badge.userInteractionEnabled &&
-        [badge pointInside:[stack convertPoint:point toView:badge] withEvent:nil])
-      return badge;
-    return nil;
+    updateMediaCover(view, isTagged, key);
+    return;
+  }
+  if ([NSStringFromClass(view.class) containsString:@"TitleWithThumbnailSliceView"]) {
+    updateThumbnailCovers(view, isTagged && !isPostRevealed(key), key);
+    return;
+  }
+  for (UIView *child in view.subviews) updatePostMedia(child, isTagged, key, depth + 1);
+}
+
+// The feed captures touches before they reach the cover, so it is handed them directly.
+static UIView *visibleCoverAtPoint(UIView *view, UIView *stack, CGPoint point, int depth) {
+  if (depth > 14 || view.hidden) return nil;
+  if (view.tag == kCoverTag) {
+    return [view pointInside:[stack convertPoint:point toView:view] withEvent:nil] ? view : nil;
   }
   for (UIView *child in view.subviews) {
-    UILabel *found = tappableBadgeAtPoint(child, stack, point, depth + 1);
+    UIView *found = visibleCoverAtPoint(child, stack, point, depth + 1);
     if (found) return found;
   }
   return nil;
 }
 
 static void refreshAdultBadges(UIView *stack) {
-  updateAdultBadges(stack, blurEnabled && hasAdultTag(stack, 0), clearAddressesInStack(stack, 0), 0);
+  NSString *longest = nil;
+  NSString *key = findPostKey(stack, &longest, 0) ?: longest;
+  updatePostMedia(stack, blurEnabled && hasAdultTag(stack, 0), key, 0);
 }
 
 // The online dot would stay alone next to the emptied count.
@@ -1054,10 +1017,8 @@ static BOOL isZeroOnline(NSString *text) {
   if (!objc_getAssociatedObject(self, &kFeedMediaKey)) return;
   __weak UIView *weakView = self;
   dispatch_async(dispatch_get_main_queue(), ^{
-    Class feedStack = NSClassFromString(@"FeedKit_Slices.FeedStackSliceView");
     UIView *view = weakView;
-    while (view && ![view isKindOfClass:feedStack]) view = view.superview;
-    if (view) refreshAdultBadges(view);
+    if (view) refreshFeedStackOf(view);
   });
 }
 %end
@@ -1086,8 +1047,8 @@ static BOOL isZeroOnline(NSString *text) {
 %hook FeedStackSliceView
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
   UIView *stack = (UIView *)self;
-  UILabel *badge = tappableBadgeAtPoint(stack, stack, point, 0);
-  return badge ?: %orig;
+  UIView *cover = visibleCoverAtPoint(stack, stack, point, 0);
+  return cover ?: %orig;
 }
 - (void)layoutSubviews {
   %orig;
@@ -1159,6 +1120,7 @@ static BOOL isZeroOnline(NSString *text) {
 %ctor {
   clearAddressesByTitle = [NSMutableDictionary dictionary];
   revealedImages = [NSCache new];
+  revealedPosts = [NSMutableSet set];
   zeroOnlineText = [NSRegularExpression
       regularExpressionWithPattern:@"^[\\s•·]*(0|no|sin|ning[uú]n)\\s+((users?|usuarios?|personas?)\\s+)?"
                                    @"(online|conectad[oa]s?|en l[ií]nea)[\\s•·]*$"
