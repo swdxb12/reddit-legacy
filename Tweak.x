@@ -354,6 +354,8 @@ static void logCoverState(UIView *media, BOOL covered, NSUInteger addresses) {
 
 static void logTap(void) { writeLog(@"TAP cover"); }
 
+static void logGameBundleNotice(NSData *data);
+
 static BOOL dataHasUpgradeNotice(NSData *data) {
   for (NSString *word in @[ @"latest version", @"Uh oh", @"upgrade your app" ]) {
     if ([data rangeOfData:[word dataUsingEncoding:NSUTF8StringEncoding] options:0 range:NSMakeRange(0, data.length)].location != NSNotFound)
@@ -372,6 +374,39 @@ static void logGameResponse(NSURLRequest *request, NSURLResponse *response, NSDa
                                       [http valueForHTTPHeaderField:@"Content-Encoding"],
                                       [http valueForHTTPHeaderField:@"grpc-status"], (unsigned long)data.length,
                                       dataHasUpgradeNotice(data)]);
+  if (dataHasUpgradeNotice(data)) logGameBundleNotice(data);
+}
+
+static void logGameBundleNotice(NSData *data) {
+  static NSUInteger logged = 0;
+  if (logged >= 2) return;
+  NSString *code = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+  if (!code) {
+    writeLog(@"GAMECODE not utf8");
+    return;
+  }
+  NSRange notice = [code rangeOfString:@"requires the latest version"];
+  if (notice.location == NSNotFound) notice = [code rangeOfString:@"Uh oh"];
+  if (notice.location == NSNotFound) return;
+  logged++;
+  writeLog([NSString stringWithFormat:@"GAMECODE length=%lu at=%lu start=%@", (unsigned long)code.length,
+                                      (unsigned long)notice.location, [code substringToIndex:MIN(200, code.length)]]);
+  NSUInteger start = notice.location > 4000 ? notice.location - 4000 : 0;
+  NSUInteger end = MIN(code.length, notice.location + 1200);
+  NSString *around = [code substringWithRange:NSMakeRange(start, end - start)];
+  for (NSUInteger offset = 0; offset < around.length; offset += 900) {
+    writeLog([NSString stringWithFormat:@"GAMECODE[%lu] %@", (unsigned long)(offset / 900),
+                                        [around substringWithRange:NSMakeRange(offset, MIN(900, around.length - offset))]]);
+  }
+}
+
+// Highlight cards draw their NSFW mark without a label, so their views are listed once.
+static void logHighlightCard(UIView *view, int depth) {
+  if (depth > 5) return;
+  writeLog([NSString stringWithFormat:@"HIGHLIGHT depth=%d %@ %.0fx%.0f hidden=%d layers=%lu", depth,
+                                      NSStringFromClass(view.class), view.bounds.size.width, view.bounds.size.height,
+                                      view.hidden, (unsigned long)view.layer.sublayers.count]);
+  for (UIView *child in view.subviews) logHighlightCard(child, depth + 1);
 }
 
 static void logInitialRender(NSString *value) {
@@ -448,7 +483,7 @@ static void logContextMenu(id delegate) {
 
 static void logStructure(NSDictionary *dict, NSString *path, NSString *operation) {
   if ([dict[@"__typename"] isEqual:@"LegacyVideoCell"]) logVideoCell(dict);
-  BOOL isMedia = dict[@"isObfuscated"] != nil;
+  BOOL isMedia = dict[@"isObfuscated"] != nil || [path containsString:@"highlightedPosts"];
   BOOL isFeedCell = dict[@"__typename"] != nil && [operation hasSuffix:@"Sdui"];
   if (!isMedia && !isFeedCell) return;
   NSMutableArray<NSString *> *fields = [NSMutableArray array];
@@ -524,9 +559,12 @@ static void logAvatarRequest(NSURL *url) {
 }
 
 // Finds on-screen text that never goes through UILabel, such as custom or SwiftUI views.
+static void logHighlightCard(UIView *view, int depth);
+
 static void logVisibleText(UIView *view, int depth) {
   if (depth > 40) return;
   NSString *className = NSStringFromClass(view.class);
+  if ([className containsString:@"HighlightThumbnailView"]) logHighlightCard(view, 0);
   if (matches(overlayClass, className) && ![className hasPrefix:@"UI"] && ![className hasPrefix:@"_UI"]) {
     writeLog([NSString stringWithFormat:@"OVERLAY %@ < %@ hidden=%d alpha=%.2f", className,
                                         NSStringFromClass(view.superview.class), view.hidden, view.alpha]);

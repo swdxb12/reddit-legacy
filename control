@@ -1,6 +1,6 @@
 Package: com.redditlegacy.tweak
 Name: RedditLegacy
-Version: 1.0.26
+Version: 1.0.27
 Architecture: iphoneos-arm
 Description: Keeps the Reddit app usable on iOS 15
 Maintainer: swdxb12
