@@ -1,0 +1,18 @@
+{
+  "minVersion": "0.4",
+  "class": "DepictionTabView",
+  "headerImage": "https://swdxb12.github.io/reddit-legacy/package/header.jpg",
+  "tintColor": "#FF4500",
+  "tabs": [
+    {
+      "tabname": "Details",
+      "class": "DepictionStackView",
+      "views": [
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "Mantiene la app oficial de Reddit usable en iOS 15. Probado con Reddit 2025.32 y Dopamine.\n\n- Quita los anuncios del feed\n- Quita el cartel NSFW y conserva el blur\n- Quita el contador \"0 en línea\", que Reddit ya no envía"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+.theos/
+packages/
+out/
+repo/
+logs/
+__pycache__/

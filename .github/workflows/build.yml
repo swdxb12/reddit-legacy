@@ -1,0 +1,72 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dev:
+        description: "Include log upload and diagnostics"
+        type: boolean
+        default: false
+
+jobs:
+  deb:
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          brew install dpkg ldid make
+          echo "$(brew --prefix)/opt/make/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Install Theos and SDK
+        run: |
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
+          git clone --depth 1 https://github.com/theos/sdks.git "$RUNNER_TEMP/sdks"
+          cp -R "$RUNNER_TEMP/sdks/iPhoneOS16.5.sdk" "$HOME/theos/sdks/"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: Build rootless deb
+        run: make package FINALPACKAGE=1 RELEASE=${{ inputs.dev && '0' || '1' }}
+
+      - name: Remove package metadata
+        run: |
+          for deb in packages/*.deb; do
+            python3 tools/clean_deb.py "$deb"
+            dpkg-deb --info "$deb"
+            dpkg-deb --contents "$deb"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RedditLegacy-deb
+          path: packages/*.deb
+
+      - name: Build APT repo
+        if: ${{ !inputs.dev }}
+        run: |
+          python3 tools/make_repo.py packages site
+          cp assets/CydiaIcon.png assets/CydiaIcon@2x.png site/
+          cp -R assets/package site/package
+          touch site/.nojekyll
+
+      - name: Publish APT repo
+        if: ${{ !inputs.dev }}
+        env:
+          TOKEN: ${{ github.token }}
+          GIT_AUTHOR_NAME: none
+          GIT_AUTHOR_EMAIL: none@invalid
+          GIT_AUTHOR_DATE: 2000-01-01T00:00:00Z
+          GIT_COMMITTER_NAME: none
+          GIT_COMMITTER_EMAIL: none@invalid
+          GIT_COMMITTER_DATE: 2000-01-01T00:00:00Z
+        run: |
+          cd site
+          git init -q -b gh-pages
+          git add -A
+          git commit -q -m "Publish APT repo"
+          git push -q --force "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages

@@ -1,0 +1,11 @@
+Package: com.redditlegacy.tweak
+Name: RedditLegacy
+Version: 1.0.13
+Architecture: iphoneos-arm
+Description: Keeps the Reddit app usable on iOS 15
+Maintainer: swdxb12
+Author: swdxb12
+Depends: mobilesubstrate
+Icon: https://swdxb12.github.io/reddit-legacy/package/icon.png
+Header: https://swdxb12.github.io/reddit-legacy/package/header.jpg
+SileoDepiction: https://swdxb12.github.io/reddit-legacy/package/depiction.json
