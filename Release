@@ -1,0 +1,23 @@
+Origin: RedditLegacy
+Label: RedditLegacy
+Suite: stable
+Version: 1.0
+Codename: stable
+Architectures: iphoneos-arm64
+Components: main
+Description: RedditLegacy tweak
+MD5Sum:
+ 43c0b654a03942af3b06fefe5427b269 674 Packages
+ 27911b12c8b28a122280bd2b57edaabd 406 Packages.gz
+ cb3cf0ac6261cf2b5c139a17c6d43f86 461 Packages.bz2
+ 3daddcd40ddea8a83343a6cbce38f781 480 Packages.xz
+SHA1:
+ fc14a81f05d5f7480620e57649057cde88ea28e6 674 Packages
+ 8f766c663636202598863bf664b4224469c27be9 406 Packages.gz
+ 0624c31a8280ce8c92f19746f2c9cbdf11c414ef 461 Packages.bz2
+ c1879954477a68a71d8f8a675bc3254fe478a6c3 480 Packages.xz
+SHA256:
+ 002e7fbb1a47a6eae8d66c2c5e8165e36d6e6d5464707095d6419ec6aca70298 674 Packages
+ 67b22609b1e1ea1a30a62ea2f5f1f7e9c935a2e3ab7dcbe6e0ea65c9ae067468 406 Packages.gz
+ 8cdc266373903c9b5cf9320385771da89c4e36d612c09f94e4bd725f379dd070 461 Packages.bz2
+ 20d98ee872d7316ce8b11727f7b9346840867c8e546ee7ec64efb8cc6a33c776 480 Packages.xz
