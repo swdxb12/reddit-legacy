@@ -34,8 +34,8 @@ static __weak UIView *lastTouchedStack;
 static char kPostKey;
 static char kFeedMediaKey;
 static NSString *const kGameClientVersion = @"2026.44.0";
-static NSString *const kGameClientBuildNumber = @"700000";
-static NSString *const kGameClientBuild = @"2026.44.0.700000";
+static NSString *const kGameClientBuildNumber = @"9999999";
+static NSString *const kGameClientBuild = @"2026.44.0.9999999";
 
 static NSRegularExpression *zeroOnlineText;
 static NSRegularExpression *zeroCountText;
@@ -354,6 +354,8 @@ static void logCoverState(UIView *media, BOOL covered, NSUInteger addresses) {
 
 static void logTap(void) { writeLog(@"TAP cover"); }
 
+static void logGamePatch(NSUInteger count) { writeLog([NSString stringWithFormat:@"GAMEPATCH checks=%lu", (unsigned long)count]); }
+
 static void logGameBundleNotice(NSData *data);
 
 static BOOL dataHasUpgradeNotice(NSData *data) {
@@ -658,6 +660,7 @@ static inline void logFeedStackFound(BOOL found) {}
 static inline void logCoverState(UIView *media, BOOL covered, NSUInteger addresses) {}
 static inline void logReveal(NSUInteger index, BOOL decoded) {}
 static inline void logTap(void) {}
+static inline void logGamePatch(NSUInteger count) {}
 static inline void logGameResponse(NSURLRequest *request, NSURLResponse *response, NSData *data) {}
 static inline void logDownload(NSString *text) {}
 static inline void logPresented(UIViewController *controller) {}
@@ -676,7 +679,7 @@ static inline void logGraphQLErrors(id json, NSString *operation) {}
 static inline void logLabel(UILabel *label, NSString *text) {}
 static inline void logAvatarRequest(NSURL *url) {}
 static inline void logScreen(UIViewController *controller) {}
-static inline BOOL shouldWrap(NSString *host) { return isAPIHost(host); }
+static inline BOOL shouldWrap(NSString *host) { return isAPIHost(host) || [host containsString:@"devvit"]; }
 #endif
 
 // Empties ad containers in place. Each field keeps its original JSON type, because the app's
@@ -776,6 +779,12 @@ static void rememberPostImages(NSDictionary *group) {
   }
 }
 
+// Highlight cards show an NSFW circle in place of the avatar when the author's profile is NSFW,
+// even if the post isn't. The post's own 18+ tag is what should say so.
+static BOOL isHighlightAuthorProfile(NSString *path) {
+  return [path containsString:@"highlightedPosts"] && [path hasSuffix:@"authorInfo.profile"];
+}
+
 static BOOL isSubredditObject(NSDictionary *dict, NSString *path) {
   if ([dict[@"__typename"] isEqual:@"Subreddit"]) return YES;
   return [[path componentsSeparatedByString:@"."].lastObject hasPrefix:@"subreddit"];
@@ -800,7 +809,7 @@ static BOOL processJSON(id object, NSString *path, NSString *operation, int dept
         blurEnabled = [value boolValue];
       if ([key isEqualToString:@"isNsfw"] && [value isKindOfClass:NSNumber.class] &&
           [value boolValue] && [dict isKindOfClass:NSMutableDictionary.class] &&
-          isSubredditObject(dict, path)) {
+          (isSubredditObject(dict, path) || isHighlightAuthorProfile(path))) {
         dict[key] = @NO;
         changed = YES;
       } else if (processJSON(value, keyPath, operation, depth + 1)) {
@@ -833,7 +842,28 @@ static BOOL processJSON(id object, NSString *path, NSString *operation, int dept
   return changed;
 }
 
+// Games carry their own "upgrade your app" check, which compares the app's build number with a
+// minimum. It is made never to apply, so the game gets the chance to run.
+static NSData *patchGameCode(NSData *data) {
+  static NSData *marker;
+  static NSRegularExpression *check;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    marker = [@"versionNumber" dataUsingEncoding:NSUTF8StringEncoding];
+    check = [NSRegularExpression regularExpressionWithPattern:@"(versionNumber\\s*<\\s*)\\d+" options:0 error:nil];
+  });
+  if (data.length == 0 || [data rangeOfData:marker options:0 range:NSMakeRange(0, data.length)].location == NSNotFound) return data;
+  NSString *code = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+  if (!code) return data;
+  NSUInteger count = [check numberOfMatchesInString:code options:0 range:NSMakeRange(0, code.length)];
+  logGamePatch(count);
+  if (count == 0) return data;
+  NSString *patched = [check stringByReplacingMatchesInString:code options:0 range:NSMakeRange(0, code.length) withTemplate:@"$10"];
+  return [patched dataUsingEncoding:NSUTF8StringEncoding] ?: data;
+}
+
 static NSData *processResponse(NSURLRequest *request, NSString *operation, NSData *data) {
+  if ([request.URL.host containsString:@"devvit"]) return patchGameCode(data);
   if (!isAPIHost(request.URL.host) || data.length == 0 || data.length > kMaxJSONBytes) return data;
   id json = [NSJSONSerialization JSONObjectWithData:data
                                             options:NSJSONReadingMutableContainers
