@@ -13,6 +13,7 @@
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
 #import <AVFoundation/AVFoundation.h>
+#import <JavaScriptCore/JavaScriptCore.h>
 #import <Photos/Photos.h>
 #import <objc/runtime.h>
 
@@ -354,7 +355,13 @@ static void logCoverState(UIView *media, BOOL covered, NSUInteger addresses) {
 
 static void logTap(void) { writeLog(@"TAP cover"); }
 
-static void logGamePatch(NSUInteger count) { writeLog([NSString stringWithFormat:@"GAMEPATCH checks=%lu", (unsigned long)count]); }
+static void logGamePatch(NSString *source, NSUInteger length, NSUInteger count) {
+  writeLog([NSString stringWithFormat:@"GAMEPATCH from=%@ length=%lu checks=%lu", source, (unsigned long)length, (unsigned long)count]);
+}
+
+static void logScript(NSString *source, NSUInteger length) {
+  writeLog([NSString stringWithFormat:@"SCRIPT from=%@ length=%lu", source, (unsigned long)length]);
+}
 
 static void logGameBundleNotice(NSData *data);
 
@@ -660,7 +667,8 @@ static inline void logFeedStackFound(BOOL found) {}
 static inline void logCoverState(UIView *media, BOOL covered, NSUInteger addresses) {}
 static inline void logReveal(NSUInteger index, BOOL decoded) {}
 static inline void logTap(void) {}
-static inline void logGamePatch(NSUInteger count) {}
+static inline void logGamePatch(NSString *source, NSUInteger length, NSUInteger count) {}
+static inline void logScript(NSString *source, NSUInteger length) {}
 static inline void logGameResponse(NSURLRequest *request, NSURLResponse *response, NSData *data) {}
 static inline void logDownload(NSString *text) {}
 static inline void logPresented(UIViewController *controller) {}
@@ -844,21 +852,25 @@ static BOOL processJSON(id object, NSString *path, NSString *operation, int dept
 
 // Games carry their own "upgrade your app" check, which compares the app's build number with a
 // minimum. It is made never to apply, so the game gets the chance to run.
-static NSData *patchGameCode(NSData *data) {
-  static NSData *marker;
+static NSString *patchGameScript(NSString *code, NSString *source) {
   static NSRegularExpression *check;
   static dispatch_once_t once;
   dispatch_once(&once, ^{
-    marker = [@"versionNumber" dataUsingEncoding:NSUTF8StringEncoding];
     check = [NSRegularExpression regularExpressionWithPattern:@"(versionNumber\\s*<\\s*)\\d+" options:0 error:nil];
   });
-  if (data.length == 0 || [data rangeOfData:marker options:0 range:NSMakeRange(0, data.length)].location == NSNotFound) return data;
+  if (code.length == 0 || [code rangeOfString:@"versionNumber"].location == NSNotFound) return code;
+  NSUInteger count = [check numberOfMatchesInString:code options:0 range:NSMakeRange(0, code.length)];
+  logGamePatch(source, code.length, count);
+  if (count == 0) return code;
+  return [check stringByReplacingMatchesInString:code options:0 range:NSMakeRange(0, code.length) withTemplate:@"$10"];
+}
+
+static NSData *patchGameCode(NSData *data) {
+  if (data.length == 0) return data;
   NSString *code = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
   if (!code) return data;
-  NSUInteger count = [check numberOfMatchesInString:code options:0 range:NSMakeRange(0, code.length)];
-  logGamePatch(count);
-  if (count == 0) return data;
-  NSString *patched = [check stringByReplacingMatchesInString:code options:0 range:NSMakeRange(0, code.length) withTemplate:@"$10"];
+  NSString *patched = patchGameScript(code, @"network");
+  if (patched == code) return data;
   return [patched dataUsingEncoding:NSUTF8StringEncoding] ?: data;
 }
 
@@ -1698,6 +1710,30 @@ static BOOL isZeroOnline(UILabel *label, NSString *text) {
   return %orig(requestForGameServers(request), wrapped);
 }
 %end
+
+%hook JSContext
+- (JSValue *)evaluateScript:(NSString *)script {
+  logScript(@"evaluateScript", script.length);
+  return %orig(patchGameScript(script, @"evaluateScript"));
+}
+- (JSValue *)evaluateScript:(NSString *)script withSourceURL:(NSURL *)sourceURL {
+  logScript(@"evaluateScriptURL", script.length);
+  return %orig(patchGameScript(script, @"evaluateScriptURL"), sourceURL);
+}
+%end
+
+%hookf(JSValueRef, JSEvaluateScript, JSContextRef context, JSStringRef script, JSObjectRef thisObject,
+       JSStringRef sourceURL, int startingLine, JSValueRef *exception) {
+  CFStringRef text = script ? JSStringCopyCFString(kCFAllocatorDefault, script) : NULL;
+  NSString *code = (__bridge_transfer NSString *)text;
+  logScript(@"JSEvaluateScript", code.length);
+  NSString *patched = patchGameScript(code, @"JSEvaluateScript");
+  if (!patched || patched == code) return %orig;
+  JSStringRef replacement = JSStringCreateWithCFString((__bridge CFStringRef)patched);
+  JSValueRef result = %orig(context, replacement, thisObject, sourceURL, startingLine, exception);
+  JSStringRelease(replacement);
+  return result;
+}
 
 %hook UIViewController
 - (void)presentViewController:(UIViewController *)controller animated:(BOOL)animated completion:(id)completion {
