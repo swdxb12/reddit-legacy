@@ -15,7 +15,7 @@ else
 # Logos still emits the Diagnostics hooks, which a release build never activates.
 RedditLegacy_CFLAGS += -Wno-unused-function
 endif
-RedditLegacy_FRAMEWORKS = UIKit Foundation
+RedditLegacy_FRAMEWORKS = UIKit Foundation AVFoundation Photos CoreMedia
 # Leaves build identifiers out of the binary.
 RedditLegacy_LDFLAGS = -Wl,-no_uuid,-no_source_version,-no_function_starts,-no_data_in_code_info
 RedditLegacy_CODESIGN_FLAGS = -S -Itweak

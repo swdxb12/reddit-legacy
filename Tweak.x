@@ -5,6 +5,7 @@
 //  - Removes ads from GraphQL responses.
 //  - Reports a current version to Reddit's game servers.
 //  - Blurs all 18+ feed media with a "View 18+ content" cover; a tap reveals that post in place.
+//  - Holding a clip in the feed offers to save it to Photos.
 //
 // Development builds (without RELEASE=1) also write and upload a diagnostics log: field names,
 // numbers, booleans, API error messages, screen classes and short on-screen labels matching
@@ -13,6 +14,7 @@
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
 #import <AVFoundation/AVFoundation.h>
+#import <Photos/Photos.h>
 #import <objc/runtime.h>
 
 static const NSUInteger kMaxJSONBytes = 20 * 1024 * 1024;
@@ -24,6 +26,8 @@ static const CGFloat kMinThumbnailWidth = 40;
 static NSMutableDictionary<NSString *, NSArray<NSString *> *> *clearAddressesByTitle;
 static NSCache<NSString *, UIImage *> *revealedImages;
 static NSMutableSet<NSString *> *revealedPosts;
+static NSMutableDictionary<NSString *, NSDictionary *> *clipsByTitle;
+static char kLongPressKey;
 static char kPostKey;
 static char kFeedMediaKey;
 // Newest platform version this app version can be expected to accept; see processJSON.
@@ -346,6 +350,8 @@ static void logCoverState(UIView *media, BOOL covered, NSUInteger addresses) {
 
 static void logTap(void) { writeLog(@"TAP cover"); }
 
+static void logDownload(NSString *text) { writeLog([@"DOWNLOAD " stringByAppendingString:text]); }
+
 static void logClipBlurHidden(void) { writeLog(@"CLIPBLUR hidden"); }
 
 static void logRevealApplied(NSUInteger page, NSUInteger views, NSUInteger updated) {
@@ -582,6 +588,7 @@ static inline void logFeedStackFound(BOOL found) {}
 static inline void logCoverState(UIView *media, BOOL covered, NSUInteger addresses) {}
 static inline void logReveal(NSUInteger index, BOOL decoded) {}
 static inline void logTap(void) {}
+static inline void logDownload(NSString *text) {}
 static inline void logPresented(UIViewController *controller) {}
 static inline void logContextMenu(id delegate) {}
 static inline void logClipBlurHidden(void) {}
@@ -669,10 +676,20 @@ static void rememberPostImages(NSDictionary *group) {
   NSArray *cells = group[@"cells"];
   if (![cells isKindOfClass:NSArray.class]) return;
   NSString *title = nil;
+  NSDictionary *clip = nil;
   NSMutableArray<NSString *> *addresses = [NSMutableArray array];
+  NSMutableArray *allCells = [cells mutableCopy];
   for (NSDictionary *cell in cells) {
+    id inner = [cell isKindOfClass:NSDictionary.class] ? cell[@"innerPost"] : nil;
+    if ([inner isKindOfClass:NSDictionary.class] && [inner[@"cells"] isKindOfClass:NSArray.class])
+      [allCells addObjectsFromArray:inner[@"cells"]];
+  }
+  for (NSDictionary *cell in allCells) {
     if (![cell isKindOfClass:NSDictionary.class]) continue;
     NSString *type = cell[@"__typename"];
+    if ([type isEqual:@"LegacyVideoCell"] && !clip && [cell[@"media"] isKindOfClass:NSDictionary.class] &&
+        [cell[@"media"][@"path"] isKindOfClass:NSString.class])
+      clip = @{ @"path" : cell[@"media"][@"path"], @"isGif" : @([cell[@"isGif"] boolValue]) };
     if ([type isEqual:@"TitleCell"] && [cell[@"title"] isKindOfClass:NSString.class]) title = cell[@"title"];
     if ([type isEqual:@"ImageCell"]) addClearAddress(cell[@"media"], addresses);
     if ([type isEqual:@"GalleryCell"] && [cell[@"pages"] isKindOfClass:NSArray.class]) {
@@ -681,7 +698,11 @@ static void rememberPostImages(NSDictionary *group) {
     }
   }
   if (title.length == 0) return;
-  @synchronized(clearAddressesByTitle) { clearAddressesByTitle[normalizedTitle(title)] = addresses; }
+  NSString *key = normalizedTitle(title);
+  @synchronized(clearAddressesByTitle) {
+    clearAddressesByTitle[key] = addresses;
+    if (clip) clipsByTitle[key] = clip;
+  }
 }
 
 static BOOL isSubredditObject(NSDictionary *dict, NSString *path) {
@@ -912,11 +933,291 @@ static void fetchClearImages(UIView *host, NSString *key) {
   }
 }
 
+typedef NS_ENUM(NSUInteger, DownloadText) {
+  DownloadTextGif,
+  DownloadTextVideo,
+  DownloadTextProgress,
+  DownloadTextSaved,
+  DownloadTextFailed,
+  DownloadTextCancel,
+};
+
+static NSString *downloadText(DownloadText which) {
+  NSDictionary<NSString *, NSArray<NSString *> *> *texts = @{
+    @"ar" : @[ @"تنزيل GIF", @"تنزيل الفيديو", @"جارٍ التنزيل…", @"تم الحفظ في الصور", @"تعذر التنزيل", @"إلغاء" ],
+    @"cs" : @[ @"Stáhnout GIF", @"Stáhnout video", @"Stahování…", @"Uloženo do Fotek", @"Stažení se nezdařilo", @"Zrušit" ],
+    @"da" : @[ @"Download GIF", @"Download video", @"Downloader…", @"Gemt i Fotos", @"Kunne ikke downloade", @"Annuller" ],
+    @"de" : @[ @"GIF laden", @"Video laden", @"Wird geladen…", @"In Fotos gesichert", @"Download fehlgeschlagen", @"Abbrechen" ],
+    @"el" : @[ @"Λήψη GIF", @"Λήψη βίντεο", @"Λήψη…", @"Αποθηκεύτηκε στις Φωτογραφίες", @"Η λήψη απέτυχε", @"Ακύρωση" ],
+    @"en" : @[ @"Download GIF", @"Download video", @"Downloading…", @"Saved to Photos", @"Download failed", @"Cancel" ],
+    @"es" : @[ @"Descargar GIF", @"Descargar vídeo", @"Descargando…", @"Guardado en Fotos", @"No se pudo descargar", @"Cancelar" ],
+    @"fi" : @[ @"Lataa GIF", @"Lataa video", @"Ladataan…", @"Tallennettu Kuviin", @"Lataus epäonnistui", @"Kumoa" ],
+    @"fr" : @[ @"Télécharger le GIF", @"Télécharger la vidéo", @"Téléchargement…", @"Enregistré dans Photos", @"Échec du téléchargement", @"Annuler" ],
+    @"he" : @[ @"הורדת GIF", @"הורדת וידאו", @"מוריד…", @"נשמר בתמונות", @"ההורדה נכשלה", @"ביטול" ],
+    @"hi" : @[ @"GIF डाउनलोड करें", @"वीडियो डाउनलोड करें", @"डाउनलोड हो रहा है…", @"Photos में सहेजा गया", @"डाउनलोड विफल", @"रद्द करें" ],
+    @"hu" : @[ @"GIF letöltése", @"Videó letöltése", @"Letöltés…", @"Mentve a Fotókba", @"A letöltés sikertelen", @"Mégse" ],
+    @"id" : @[ @"Unduh GIF", @"Unduh video", @"Mengunduh…", @"Disimpan ke Foto", @"Gagal mengunduh", @"Batal" ],
+    @"it" : @[ @"Scarica GIF", @"Scarica video", @"Download…", @"Salvato in Foto", @"Download non riuscito", @"Annulla" ],
+    @"ja" : @[ @"GIFをダウンロード", @"動画をダウンロード", @"ダウンロード中…", @"写真に保存しました", @"ダウンロードに失敗しました", @"キャンセル" ],
+    @"ko" : @[ @"GIF 다운로드", @"동영상 다운로드", @"다운로드 중…", @"사진에 저장됨", @"다운로드 실패", @"취소" ],
+    @"nb" : @[ @"Last ned GIF", @"Last ned video", @"Laster ned…", @"Lagret i Bilder", @"Nedlasting mislyktes", @"Avbryt" ],
+    @"nl" : @[ @"GIF downloaden", @"Video downloaden", @"Downloaden…", @"Bewaard in Foto's", @"Downloaden mislukt", @"Annuleer" ],
+    @"pl" : @[ @"Pobierz GIF", @"Pobierz wideo", @"Pobieranie…", @"Zapisano w Zdjęciach", @"Nie udało się pobrać", @"Anuluj" ],
+    @"pt" : @[ @"Baixar GIF", @"Baixar vídeo", @"Baixando…", @"Salvo em Fotos", @"Falha ao baixar", @"Cancelar" ],
+    @"ro" : @[ @"Descarcă GIF", @"Descarcă video", @"Se descarcă…", @"Salvat în Poze", @"Descărcare eșuată", @"Anulează" ],
+    @"ru" : @[ @"Скачать GIF", @"Скачать видео", @"Загрузка…", @"Сохранено в Фото", @"Не удалось скачать", @"Отмена" ],
+    @"sv" : @[ @"Ladda ner GIF", @"Ladda ner video", @"Laddar ner…", @"Sparat i Bilder", @"Nedladdningen misslyckades", @"Avbryt" ],
+    @"th" : @[ @"ดาวน์โหลด GIF", @"ดาวน์โหลดวิดีโอ", @"กำลังดาวน์โหลด…", @"บันทึกลงในรูปภาพแล้ว", @"ดาวน์โหลดไม่สำเร็จ", @"ยกเลิก" ],
+    @"tr" : @[ @"GIF'i indir", @"Videoyu indir", @"İndiriliyor…", @"Fotoğraflar'a kaydedildi", @"İndirilemedi", @"Vazgeç" ],
+    @"uk" : @[ @"Завантажити GIF", @"Завантажити відео", @"Завантаження…", @"Збережено у Фото", @"Не вдалося завантажити", @"Скасувати" ],
+    @"vi" : @[ @"Tải GIF", @"Tải video", @"Đang tải…", @"Đã lưu vào Ảnh", @"Không tải được", @"Hủy" ],
+    @"zh-Hans" : @[ @"下载 GIF", @"下载视频", @"正在下载…", @"已存储到照片", @"下载失败", @"取消" ],
+    @"zh-Hant" : @[ @"下載 GIF", @"下載影片", @"正在下載…", @"已儲存到照片", @"下載失敗", @"取消" ],
+  };
+  NSArray<NSString *> *strings = texts[appLanguageKey(texts)] ?: texts[@"en"];
+  return strings[which];
+}
+
+static void showDownloadNotice(NSString *text) {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    static UILabel *notice;
+    UIWindow *window = nil;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+      if (![scene isKindOfClass:UIWindowScene.class]) continue;
+      for (UIWindow *candidate in ((UIWindowScene *)scene).windows) {
+        if (candidate.isKeyWindow) window = candidate;
+      }
+    }
+    if (!window) return;
+    if (!notice) {
+      notice = [UILabel new];
+      notice.font = [UIFont boldSystemFontOfSize:14];
+      notice.textColor = UIColor.whiteColor;
+      notice.textAlignment = NSTextAlignmentCenter;
+      notice.backgroundColor = [UIColor colorWithWhite:0 alpha:0.85];
+      notice.clipsToBounds = YES;
+      notice.userInteractionEnabled = NO;
+    }
+    notice.text = text;
+    CGSize size = [notice sizeThatFits:CGSizeZero];
+    CGFloat height = size.height + 18;
+    notice.layer.cornerRadius = height / 2;
+    CGFloat width = MIN(size.width + 32, CGRectGetWidth(window.bounds) - 32);
+    notice.frame = CGRectMake((CGRectGetWidth(window.bounds) - width) / 2,
+                              CGRectGetHeight(window.bounds) - window.safeAreaInsets.bottom - 110, width, height);
+    notice.alpha = 1;
+    [window addSubview:notice];
+    static NSUInteger generation = 0;
+    NSUInteger current = ++generation;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+      if (current == generation) [notice removeFromSuperview];
+    });
+  });
+}
+
+static NSURL *temporaryFile(NSString *extension) {
+  NSString *name = [NSUUID.UUID.UUIDString stringByAppendingPathExtension:extension];
+  return [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:name]];
+}
+
+static void saveFileToPhotos(NSURL *file, BOOL isPhotoResource, NSArray<NSURL *> *temporary) {
+  void (^finish)(BOOL) = ^(BOOL saved) {
+    for (NSURL *url in temporary) [NSFileManager.defaultManager removeItemAtURL:url error:nil];
+    showDownloadNotice(downloadText(saved ? DownloadTextSaved : DownloadTextFailed));
+  };
+  // iOS ends the app if it asks for Photos access without declaring why in its Info.plist.
+  NSDictionary *info = NSBundle.mainBundle.infoDictionary;
+  if (!info[@"NSPhotoLibraryAddUsageDescription"] && !info[@"NSPhotoLibraryUsageDescription"]) {
+    logDownload(@"no photos usage description");
+    finish(NO);
+    return;
+  }
+  [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelAddOnly
+                                             handler:^(PHAuthorizationStatus status) {
+    if (status != PHAuthorizationStatusAuthorized && status != PHAuthorizationStatusLimited) {
+      logDownload(@"photos access denied");
+      finish(NO);
+      return;
+    }
+    [PHPhotoLibrary.sharedPhotoLibrary performChanges:^{
+      PHAssetCreationRequest *request = [PHAssetCreationRequest creationRequestForAsset];
+      [request addResourceWithType:isPhotoResource ? PHAssetResourceTypePhoto : PHAssetResourceTypeVideo
+                           fileURL:file
+                           options:nil];
+    } completionHandler:^(BOOL success, NSError *error) {
+      logDownload([NSString stringWithFormat:@"save success=%d error=%ld", success, (long)error.code]);
+      finish(success);
+    }];
+  }];
+}
+
+// Downloads an address to a temporary file, reporting nil unless the server sent a media file.
+static void downloadToFile(NSURL *url, void (^completion)(NSURL *file, NSString *mimeType)) {
+  [[NSURLSession.sharedSession
+      downloadTaskWithURL:url
+        completionHandler:^(NSURL *location, NSURLResponse *response, NSError *error) {
+          NSInteger status = [response isKindOfClass:NSHTTPURLResponse.class]
+                                 ? ((NSHTTPURLResponse *)response).statusCode
+                                 : 0;
+          NSString *type = response.MIMEType.lowercaseString ?: @"";
+          logDownload([NSString stringWithFormat:@"%@ %@ status=%ld type=%@", url.host, url.lastPathComponent, (long)status, type]);
+          BOOL isMedia = [type hasPrefix:@"video/"] || [type hasPrefix:@"image/"] || [type hasPrefix:@"audio/"] ||
+                         [type containsString:@"mp4"];
+          if (error || !location || status < 200 || status >= 300 || !isMedia) {
+            completion(nil, nil);
+            return;
+          }
+          NSURL *file = temporaryFile([type containsString:@"gif"] ? @"gif" : @"mp4");
+          if (![NSFileManager.defaultManager moveItemAtURL:location toURL:file error:nil]) {
+            completion(nil, nil);
+            return;
+          }
+          completion(file, type);
+        }] resume];
+}
+
+// Tries file names in order until one exists.
+static void downloadFirstAvailable(NSURL *base, NSArray<NSString *> *names, NSUInteger index,
+                                   void (^completion)(NSURL *file)) {
+  if (index >= names.count) {
+    completion(nil);
+    return;
+  }
+  downloadToFile([base URLByAppendingPathComponent:names[index]], ^(NSURL *file, NSString *type) {
+    if (file) completion(file);
+    else downloadFirstAvailable(base, names, index + 1, completion);
+  });
+}
+
+static void mergeAndSave(NSURL *video, NSURL *audio) {
+  AVURLAsset *videoAsset = [AVURLAsset assetWithURL:video];
+  AVURLAsset *audioAsset = [AVURLAsset assetWithURL:audio];
+  AVAssetTrack *videoTrack = [videoAsset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+  AVAssetTrack *audioTrack = [audioAsset tracksWithMediaType:AVMediaTypeAudio].firstObject;
+  NSArray<NSURL *> *sources = @[ video, audio ];
+  if (!videoTrack || !audioTrack) {
+    [NSFileManager.defaultManager removeItemAtURL:audio error:nil];
+    saveFileToPhotos(video, NO, @[ video ]);
+    return;
+  }
+  AVMutableComposition *composition = [AVMutableComposition composition];
+  CMTimeRange range = CMTimeRangeMake(kCMTimeZero, videoAsset.duration);
+  AVMutableCompositionTrack *videoOut = [composition addMutableTrackWithMediaType:AVMediaTypeVideo preferredTrackID:kCMPersistentTrackID_Invalid];
+  AVMutableCompositionTrack *audioOut = [composition addMutableTrackWithMediaType:AVMediaTypeAudio preferredTrackID:kCMPersistentTrackID_Invalid];
+  CMTimeRange audioRange = CMTimeRangeMake(kCMTimeZero, CMTimeMinimum(videoAsset.duration, audioAsset.duration));
+  [videoOut insertTimeRange:range ofTrack:videoTrack atTime:kCMTimeZero error:nil];
+  [audioOut insertTimeRange:audioRange ofTrack:audioTrack atTime:kCMTimeZero error:nil];
+  videoOut.preferredTransform = videoTrack.preferredTransform;
+  AVAssetExportSession *export = [AVAssetExportSession exportSessionWithAsset:composition presetName:AVAssetExportPresetPassthrough];
+  NSURL *output = temporaryFile(@"mp4");
+  export.outputURL = output;
+  export.outputFileType = AVFileTypeMPEG4;
+  [export exportAsynchronouslyWithCompletionHandler:^{
+    logDownload([NSString stringWithFormat:@"merge status=%ld error=%ld", (long)export.status, (long)export.error.code]);
+    if (export.status == AVAssetExportSessionStatusCompleted) {
+      saveFileToPhotos(output, NO, [sources arrayByAddingObject:output]);
+    } else {
+      // A clip without its sound is better than no clip.
+      [NSFileManager.defaultManager removeItemAtURL:audio error:nil];
+      [NSFileManager.defaultManager removeItemAtURL:output error:nil];
+      saveFileToPhotos(video, NO, @[ video ]);
+    }
+  }];
+}
+
+// Streaming clips cannot be saved as they are, but Reddit keeps plain video and audio files beside
+// the playlist. The largest video that exists is used, joined with its sound if there is any.
+static void downloadStreamingClip(NSURL *playlist) {
+  NSURLComponents *components = [NSURLComponents componentsWithURL:playlist resolvingAgainstBaseURL:NO];
+  components.query = nil;
+  NSURL *base = components.URL.URLByDeletingLastPathComponent;
+  NSMutableArray<NSString *> *videos = [NSMutableArray array];
+  for (NSString *size in @[ @"1080", @"720", @"480", @"360", @"270", @"240", @"220" ]) {
+    [videos addObject:[NSString stringWithFormat:@"CMAF_%@.mp4", size]];
+    [videos addObject:[NSString stringWithFormat:@"DASH_%@.mp4", size]];
+  }
+  NSArray<NSString *> *audios = @[ @"CMAF_AUDIO_128.mp4", @"DASH_AUDIO_128.mp4", @"CMAF_AUDIO_64.mp4", @"DASH_AUDIO_64.mp4", @"DASH_audio.mp4" ];
+  downloadFirstAvailable(base, videos, 0, ^(NSURL *video) {
+    if (!video) {
+      showDownloadNotice(downloadText(DownloadTextFailed));
+      return;
+    }
+    downloadFirstAvailable(base, audios, 0, ^(NSURL *audio) {
+      if (audio) mergeAndSave(video, audio);
+      else saveFileToPhotos(video, NO, @[ video ]);
+    });
+  });
+}
+
+static void downloadClip(NSDictionary *clip) {
+  NSURL *url = [NSURL URLWithString:clip[@"path"]];
+  if (!url) {
+    showDownloadNotice(downloadText(DownloadTextFailed));
+    return;
+  }
+  showDownloadNotice(downloadText(DownloadTextProgress));
+  if ([url.pathExtension.lowercaseString isEqualToString:@"m3u8"]) {
+    downloadStreamingClip(url);
+    return;
+  }
+  downloadToFile(url, ^(NSURL *file, NSString *type) {
+    if (!file) {
+      showDownloadNotice(downloadText(DownloadTextFailed));
+      return;
+    }
+    saveFileToPhotos(file, [type hasPrefix:@"image/"], @[ file ]);
+  });
+}
+
+static UIView *clipContainerAtPoint(UIView *view, UIView *stack, CGPoint point, int depth) {
+  if (depth > 6) return nil;
+  if ([NSStringFromClass(view.class) containsString:@"LegacyVideo"] && isBlurredMediaContainer(view))
+    return [view pointInside:[stack convertPoint:point toView:view] withEvent:nil] ? view : nil;
+  for (UIView *child in view.subviews) {
+    UIView *found = clipContainerAtPoint(child, stack, point, depth + 1);
+    if (found) return found;
+  }
+  return nil;
+}
+
+static UIViewController *controllerOfView(UIView *view) {
+  for (UIResponder *responder = view; responder; responder = responder.nextResponder) {
+    if ([responder isKindOfClass:UIViewController.class]) return (UIViewController *)responder;
+  }
+  return nil;
+}
+
+static void presentDownloadMenu(UIView *stack, CGPoint point) {
+  if (!clipContainerAtPoint(stack, stack, point, 0)) return;
+  NSString *longest = nil;
+  NSString *key = findPostKey(stack, &longest, 0);
+  NSDictionary *clip = nil;
+  @synchronized(clearAddressesByTitle) {
+    clip = key ? clipsByTitle[key] : nil;
+  }
+  logDownload([NSString stringWithFormat:@"menu clip=%d", clip != nil]);
+  if (!clip) return;
+  UIViewController *controller = controllerOfView(stack);
+  if (!controller) return;
+  UIAlertController *menu = [UIAlertController alertControllerWithTitle:nil message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+  NSString *title = downloadText([clip[@"isGif"] boolValue] ? DownloadTextGif : DownloadTextVideo);
+  [menu addAction:[UIAlertAction actionWithTitle:title
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *action) { downloadClip(clip); }]];
+  [menu addAction:[UIAlertAction actionWithTitle:downloadText(DownloadTextCancel) style:UIAlertActionStyleCancel handler:nil]];
+  [controller presentViewController:menu animated:YES completion:nil];
+}
+
 @interface RedditLegacyCoverTarget : NSObject
 - (void)coverTapped:(UITapGestureRecognizer *)recognizer;
+- (void)stackLongPressed:(UILongPressGestureRecognizer *)recognizer;
 @end
 
 @implementation RedditLegacyCoverTarget
+- (void)stackLongPressed:(UILongPressGestureRecognizer *)recognizer {
+  if (recognizer.state != UIGestureRecognizerStateBegan) return;
+  presentDownloadMenu(recognizer.view, [recognizer locationInView:recognizer.view]);
+}
 - (void)coverTapped:(UITapGestureRecognizer *)recognizer {
   UIView *cover = recognizer.view;
   NSString *key = objc_getAssociatedObject(cover, &kPostKey);
@@ -933,7 +1234,17 @@ static void fetchClearImages(UIView *host, NSString *key) {
 }
 @end
 
-// Follows the language the app itself is running in, which can differ from the device's.
+// The language the app itself is running in, which can differ from the device's.
+static NSString *appLanguageKey(NSDictionary *available) {
+  NSString *language = NSBundle.mainBundle.preferredLocalizations.firstObject ?: @"en";
+  if (available[language]) return language;
+  if ([language hasPrefix:@"zh"]) {
+    BOOL isTraditional = [language containsString:@"Hant"] || [language containsString:@"TW"] || [language containsString:@"HK"];
+    return isTraditional ? @"zh-Hant" : @"zh-Hans";
+  }
+  return [language componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"-_"]].firstObject;
+}
+
 static NSString *adultContentButtonText(void) {
   NSDictionary<NSString *, NSString *> *texts = @{
     @"ar" : @"عرض محتوى +18",
@@ -966,14 +1277,7 @@ static NSString *adultContentButtonText(void) {
     @"zh-Hans" : @"查看 18+ 内容",
     @"zh-Hant" : @"查看 18+ 內容",
   };
-  NSString *language = NSBundle.mainBundle.preferredLocalizations.firstObject ?: @"en";
-  if (texts[language]) return texts[language];
-  if ([language hasPrefix:@"zh"]) {
-    BOOL isTraditional = [language containsString:@"Hant"] || [language containsString:@"TW"] || [language containsString:@"HK"];
-    return texts[isTraditional ? @"zh-Hant" : @"zh-Hans"];
-  }
-  NSString *base = [language componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"-_"]].firstObject;
-  return texts[base] ?: texts[@"en"];
+  return texts[appLanguageKey(texts)] ?: texts[@"en"];
 }
 
 // The blur is drawn here, so it covers all 18+ media whether or not the server sent a blurred copy.
@@ -1134,6 +1438,16 @@ static UIView *visibleCoverAtPoint(UIView *view, UIView *stack, CGPoint point, i
   return nil;
 }
 
+static void installLongPress(UIView *stack) {
+  if (objc_getAssociatedObject(stack, &kLongPressKey)) return;
+  objc_setAssociatedObject(stack, &kLongPressKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  static RedditLegacyCoverTarget *target;
+  if (!target) target = [RedditLegacyCoverTarget new];
+  UILongPressGestureRecognizer *press = [[UILongPressGestureRecognizer alloc] initWithTarget:target action:@selector(stackLongPressed:)];
+  press.cancelsTouchesInView = NO;
+  [stack addGestureRecognizer:press];
+}
+
 static void refreshAdultBadges(UIView *stack) {
   NSString *longest = nil;
   NSString *key = findPostKey(stack, &longest, 0) ?: longest;
@@ -1227,6 +1541,7 @@ static BOOL isZeroOnline(UILabel *label, NSString *text) {
 - (void)layoutSubviews {
   %orig;
   UIView *stack = (UIView *)self;
+  installLongPress(stack);
   refreshAdultBadges(stack);
   // The 18+ tag and the image address arrive after this layout pass, so they are checked again.
   __weak UIView *weakStack = stack;
@@ -1306,6 +1621,7 @@ static BOOL isZeroOnline(UILabel *label, NSString *text) {
   clearAddressesByTitle = [NSMutableDictionary dictionary];
   revealedImages = [NSCache new];
   revealedPosts = [NSMutableSet set];
+  clipsByTitle = [NSMutableDictionary dictionary];
   zeroCountText = [NSRegularExpression regularExpressionWithPattern:@"^[\\s•·]*0(\\s|\\p{L})" options:0 error:nil];
   zeroOnlineText = [NSRegularExpression
       regularExpressionWithPattern:@"^[\\s•·]*(0|no|sin|ning[uú]n)\\s+((users?|usuarios?|personas?)\\s+)?"
