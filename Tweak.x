@@ -172,6 +172,13 @@ static void probeOnlineCount(NSURLRequest *source) {
                                  @"PROBE status=%ld active_user_count=%@ accounts_active=%@ subscribers=%@",
                                  (long)status, about[@"active_user_count"],
                                  about[@"accounts_active"], about[@"subscribers"]]);
+          for (NSString *key in about) {
+            NSString *lower = key.lowercaseString;
+            if ([lower containsString:@"active"] || [lower containsString:@"online"] ||
+                [lower containsString:@"visit"] || [lower containsString:@"weekly"] ||
+                [lower containsString:@"contribut"])
+              writeLog([NSString stringWithFormat:@"ABOUT %@=%@", key, about[key]]);
+          }
         }] resume];
 }
 
@@ -192,6 +199,9 @@ static void logField(NSString *key, NSString *keyPath, id value, NSString *opera
       writeLog([NSString stringWithFormat:@"GAMEWEB %@", [NSURL URLWithString:value].host]);
     if (matches(upgradeText, value))
       writeLog([NSString stringWithFormat:@"UPGRADE %@ %@", operation, keyPath]);
+    // Weekly visitor counts appear in search, so this shows which response and field carry them.
+    if ([value length] <= 60 && [value rangeOfString:@"visit" options:NSCaseInsensitiveSearch].location != NSNotFound)
+      writeLog([NSString stringWithFormat:@"VISITS %@ %@=%@", operation, keyPath, value]);
   }
   if ([value isKindOfClass:NSString.class] && [value hasPrefix:@"http"] &&
       matches(avatarPath, keyPath) && ![keyPath containsString:@"award"])
