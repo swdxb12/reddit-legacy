@@ -933,6 +933,17 @@ static void fetchClearImages(UIView *host, NSString *key) {
   }
 }
 
+// The language the app itself is running in, which can differ from the device's.
+static NSString *appLanguageKey(NSDictionary *available) {
+  NSString *language = NSBundle.mainBundle.preferredLocalizations.firstObject ?: @"en";
+  if (available[language]) return language;
+  if ([language hasPrefix:@"zh"]) {
+    BOOL isTraditional = [language containsString:@"Hant"] || [language containsString:@"TW"] || [language containsString:@"HK"];
+    return isTraditional ? @"zh-Hant" : @"zh-Hans";
+  }
+  return [language componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"-_"]].firstObject;
+}
+
 typedef NS_ENUM(NSUInteger, DownloadText) {
   DownloadTextGif,
   DownloadTextVideo,
@@ -1233,17 +1244,6 @@ static void presentDownloadMenu(UIView *stack, CGPoint point) {
   refreshFeedStackOf(host);
 }
 @end
-
-// The language the app itself is running in, which can differ from the device's.
-static NSString *appLanguageKey(NSDictionary *available) {
-  NSString *language = NSBundle.mainBundle.preferredLocalizations.firstObject ?: @"en";
-  if (available[language]) return language;
-  if ([language hasPrefix:@"zh"]) {
-    BOOL isTraditional = [language containsString:@"Hant"] || [language containsString:@"TW"] || [language containsString:@"HK"];
-    return isTraditional ? @"zh-Hant" : @"zh-Hans";
-  }
-  return [language componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"-_"]].firstObject;
-}
 
 static NSString *adultContentButtonText(void) {
   NSDictionary<NSString *, NSString *> *texts = @{
