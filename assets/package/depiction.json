@@ -10,7 +10,7 @@
       "views": [
         {
           "class": "DepictionMarkdownView",
-          "markdown": "Mantiene la app oficial de Reddit usable en iOS 15. Probado con Reddit 2025.32 y Dopamine.\n\n- Quita los anuncios del feed\n- Quita el cartel NSFW y conserva el blur\n- Quita el contador \"0 en línea\", que Reddit ya no envía"
+          "markdown": "Keeps the official Reddit app usable on iOS 15. Tested with Reddit 2025.32 and Dopamine.\n\n- Removes ads from the feed\n- Removes the NSFW banner and keeps the blur\n- Removes the \"0 online\" count, which Reddit no longer sends"
         }
       ]
     }

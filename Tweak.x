@@ -33,6 +33,7 @@ static NSString *const kGameClientBuildNumber = @"700000";
 static NSString *const kGameClientBuild = @"2026.44.0.700000";
 
 static NSRegularExpression *zeroOnlineText;
+static NSRegularExpression *zeroCountText;
 
 static BOOL matches(NSRegularExpression *regex, NSString *text) {
   return [regex firstMatchInString:text options:0 range:NSMakeRange(0, text.length)] != nil;
@@ -881,6 +882,49 @@ static void fetchClearImages(UIView *host, NSString *key) {
 }
 @end
 
+// Follows the language the app itself is running in, which can differ from the device's.
+static NSString *adultContentButtonText(void) {
+  NSDictionary<NSString *, NSString *> *texts = @{
+    @"ar" : @"عرض محتوى +18",
+    @"cs" : @"Zobrazit obsah 18+",
+    @"da" : @"Vis 18+ indhold",
+    @"de" : @"18+ Inhalt ansehen",
+    @"el" : @"Προβολή περιεχομένου 18+",
+    @"en" : @"View 18+ content",
+    @"es" : @"Ver contenido 18+",
+    @"fi" : @"Näytä 18+ sisältö",
+    @"fr" : @"Voir le contenu 18+",
+    @"he" : @"הצגת תוכן 18+",
+    @"hi" : @"18+ सामग्री देखें",
+    @"hu" : @"18+ tartalom megtekintése",
+    @"id" : @"Lihat konten 18+",
+    @"it" : @"Mostra contenuti 18+",
+    @"ja" : @"18+コンテンツを表示",
+    @"ko" : @"18+ 콘텐츠 보기",
+    @"nb" : @"Vis 18+ innhold",
+    @"nl" : @"18+ inhoud bekijken",
+    @"pl" : @"Pokaż treści 18+",
+    @"pt" : @"Ver conteúdo 18+",
+    @"ro" : @"Vezi conținut 18+",
+    @"ru" : @"Показать контент 18+",
+    @"sv" : @"Visa 18+ innehåll",
+    @"th" : @"ดูเนื้อหา 18+",
+    @"tr" : @"18+ içeriği göster",
+    @"uk" : @"Показати вміст 18+",
+    @"vi" : @"Xem nội dung 18+",
+    @"zh-Hans" : @"查看 18+ 内容",
+    @"zh-Hant" : @"查看 18+ 內容",
+  };
+  NSString *language = NSBundle.mainBundle.preferredLocalizations.firstObject ?: @"en";
+  if (texts[language]) return texts[language];
+  if ([language hasPrefix:@"zh"]) {
+    BOOL isTraditional = [language containsString:@"Hant"] || [language containsString:@"TW"] || [language containsString:@"HK"];
+    return texts[isTraditional ? @"zh-Hant" : @"zh-Hans"];
+  }
+  NSString *base = [language componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"-_"]].firstObject;
+  return texts[base] ?: texts[@"en"];
+}
+
 // The blur is drawn here, so it covers all 18+ media whether or not the server sent a blurred copy.
 static UIView *makeCover(UIView *host, BOOL withBadge) {
   static RedditLegacyCoverTarget *target;
@@ -913,8 +957,7 @@ static UIView *makeCover(UIView *host, BOOL withBadge) {
   ]];
   if (withBadge) {
     UILabel *badge = [UILabel new];
-    BOOL isSpanish = [NSLocale.preferredLanguages.firstObject hasPrefix:@"es"];
-    badge.text = isSpanish ? @"Ver contenido 18+" : @"View 18+ content";
+    badge.text = adultContentButtonText();
     badge.font = [UIFont boldSystemFontOfSize:13];
     badge.textColor = UIColor.whiteColor;
     badge.textAlignment = NSTextAlignmentCenter;
@@ -1027,8 +1070,17 @@ static void hideOnlineDot(UILabel *label) {
   });
 }
 
-static BOOL isZeroOnline(NSString *text) {
-  return text.length > 0 && text.length <= 60 && matches(zeroOnlineText, text);
+// The online count is recognised by its text, and otherwise by where it sits: a short label starting
+// with 0 in a subreddit's header or title bar. That keeps it working in any app language.
+static BOOL isZeroOnline(UILabel *label, NSString *text) {
+  if (text.length == 0 || text.length > 60) return NO;
+  if (matches(zeroOnlineText, text)) return YES;
+  if (text.length > 30 || !matches(zeroCountText, text)) return NO;
+  for (UIView *view = label.superview; view; view = view.superview) {
+    NSString *name = NSStringFromClass(view.class);
+    if ([name containsString:@"SubredditHeaderView"] || [name containsString:@"SubredditScreenNavigationTitleView"]) return YES;
+  }
+  return NO;
 }
 
 %hook NSURLSession
@@ -1066,13 +1118,13 @@ static BOOL isZeroOnline(NSString *text) {
 // also survives the app toggling the label's visibility, and reused cells simply get new text.
 - (void)setText:(NSString *)text {
   logLabel(self, text);
-  BOOL isZero = isZeroOnline(text);
+  BOOL isZero = isZeroOnline(self, text);
   %orig(isZero ? @"" : text);
   if (isZero) hideOnlineDot(self);
 }
 - (void)setAttributedText:(NSAttributedString *)text {
   logLabel(self, text.string);
-  BOOL isZero = isZeroOnline(text.string);
+  BOOL isZero = isZeroOnline(self, text.string);
   %orig(isZero ? [[NSAttributedString alloc] initWithString:@""] : text);
   if (isZero) hideOnlineDot(self);
 }
@@ -1159,6 +1211,7 @@ static BOOL isZeroOnline(NSString *text) {
   clearAddressesByTitle = [NSMutableDictionary dictionary];
   revealedImages = [NSCache new];
   revealedPosts = [NSMutableSet set];
+  zeroCountText = [NSRegularExpression regularExpressionWithPattern:@"^[\\s•·]*0(\\s|\\p{L})" options:0 error:nil];
   zeroOnlineText = [NSRegularExpression
       regularExpressionWithPattern:@"^[\\s•·]*(0|no|sin|ning[uú]n)\\s+((users?|usuarios?|personas?)\\s+)?"
                                    @"(online|conectad[oa]s?|en l[ií]nea)[\\s•·]*$"
